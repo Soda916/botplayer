@@ -1,0 +1,15 @@
+# Python & Environment
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Config & Secrets
+.env
+
+# Logs & Storage
+*.log
+storage/
+data/

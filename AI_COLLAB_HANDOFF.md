@@ -58,6 +58,17 @@ botplayer/
   - 於 `main.py` 補齊 `libopus` 自動檢測與載入機制 (`ctypes.util.find_library("opus")`)，確保不同作業系統環境 (macOS / Linux / GCP e2-micro) 皆可正常發聲。
   - 確認 `requirements.txt` 已包含 `discord.py[voice]`，其自動帶入 `PyNaCl` (xsalsa20/xchacha20 語音封包加密) 與 `davey` (Discord 新版 DAVE 端對端語音加密協定)。
   - 通過編譯與單元測試。
+### [2026-08-20] Entry #003
+- Maintainer: `dust_AgyGemini3.6flash(mid)`
+- Session Goal: 實作 `/join` 指令及動態閒置退出時間參數（5-30 分鐘與 OWNER_ID 專屬永不退出選項）。
+- Scope: `cogs/music.py`, `.env.example`, `tests/test_botplayer.py`, `AI_COLLAB_HANDOFF.md`
+- Delta:
+  - 於 `.env.example` 新增 `OWNER_ID` 設定項說明。
+  - 於 `cogs/music.py` 實作 `/join [timeout_minutes]` 斜線指令。
+  - 一般使用者可設定 5~30 分鐘閒置退出時間；設定 0（永不退出）時會校驗 `interaction.user.id == OWNER_ID` (或 `bot.is_owner`) 權限，非 Owner 嘗試設定將予以拒絕。
+  - 重構 `start_idle_timer`，支援動態設定檔逾時時間並於 `idle_timeout_minutes <= 0` 時自動取消閒置計時器。
+  - 補齊 `test_idle_timeout_settings` 單元測試，通過 `compileall` 編譯與全部 4 項單元測試。
 - Next Relay:
-  - 於伺服器部署並測試語音頻道連線。
+  - 在 `.env` 設定 `OWNER_ID` 並在 Discord 測試伺服器測試 `/join` 各種參數與權限開關。
+
 

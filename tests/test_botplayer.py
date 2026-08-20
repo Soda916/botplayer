@@ -34,6 +34,18 @@ class TestBotPlayer(unittest.TestCase):
         self.assertEqual(len(player.queue), 0)
         self.assertEqual(len(player.history), 0)
         self.assertIsNone(player.current_track)
+        self.assertEqual(player.idle_timeout_minutes, 5, "預設閒置退出時間應為 5 分鐘")
+
+    def test_idle_timeout_settings(self):
+        """驗證閒置退出時間設定"""
+        player = GuildPlayer(guild_id=123456789)
+        player.idle_timeout_minutes = 15
+        self.assertEqual(player.idle_timeout_minutes, 15)
+
+        # 設為 0 代表永不退出
+        player.idle_timeout_minutes = 0
+        self.assertEqual(player.idle_timeout_minutes, 0)
+
 
 
 if __name__ == "__main__":

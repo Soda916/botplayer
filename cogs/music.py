@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -8,6 +9,10 @@ from discord import app_commands
 import yt_dlp
 
 logger = logging.getLogger("botplayer.music")
+
+# 從 .env 讀取 OWNER_ID (如未設定或無效則為 0)
+OWNER_ID = int(os.getenv("OWNER_ID", "0")) if os.getenv("OWNER_ID", "").isdigit() else 0
+
 
 # yt-dlp 最佳化設定：極致輕量化，只解析音訊，嚴禁下載與畫面處理，停用播放清單
 YTDL_OPTIONS = {
@@ -137,6 +142,8 @@ class GuildPlayer:
         self.panel_message: Optional[discord.Message] = None
         self.text_channel: Optional[discord.TextChannel] = None
         self.idle_timer_task: Optional[asyncio.Task] = None
+        self.idle_timeout_minutes: int = 5  # 預設閒置 5 分鐘自動退出
+
 
 
 class MusicCog(commands.Cog):
@@ -355,20 +362,26 @@ class MusicCog(commands.Cog):
         """啟動閒置自動斷線計時器 (e2-micro 防閒置資源浪費)"""
         self.cancel_idle_timer(player)
 
+        if player.idle_timeout_minutes <= 0:
+            logger.info(f"Guild {player.guild_id} 設定為永不自動退出 (idle_timeout_minutes=0)，跳過開啟閒置計時器。")
+            return
+
         async def idle_disconnect():
-            await asyncio.sleep(180)  # 閒置 3 分鐘斷線
+            timeout_secs = player.idle_timeout_minutes * 60
+            await asyncio.sleep(timeout_secs)
             if player.voice_client and player.voice_client.is_connected():
                 if not player.current_track and not player.queue:
-                    logger.info(f"Guild {player.guild_id} 閒置逾時，自動斷開語音連線以省資源。")
+                    logger.info(f"Guild {player.guild_id} 閒置超過 {player.idle_timeout_minutes} 分鐘，自動斷開語音連線以省資源。")
                     await player.voice_client.disconnect()
                     player.voice_client = None
                     if player.text_channel:
                         try:
-                            await player.text_channel.send("💤 佇列已空且閒置超過 3 分鐘，已自動離開語音頻道以節省系統資源。")
+                            await player.text_channel.send(f"💤 佇列已空且閒置超過 {player.idle_timeout_minutes} 分鐘，已自動離開語音頻道以節省系統資源。")
                         except Exception:
                             pass
 
         player.idle_timer_task = self.bot.loop.create_task(idle_disconnect())
+
 
     def cancel_idle_timer(self, player: GuildPlayer):
         if player.idle_timer_task and not player.idle_timer_task.done():
@@ -493,10 +506,66 @@ class MusicCog(commands.Cog):
         embed = self.build_queue_embed(interaction.guild_id)
         await interaction.response.send_message(embed=embed)
 
+    @app_commands.command(name="join", description="加入語音頻道並設定閒置自動退出時間")
+    @app_commands.describe(timeout_minutes="閒置自動退出時間 (5-30 分鐘；輸入 0 代表永不退出 [僅 Owner 可設])")
+    async def join(self, interaction: discord.Interaction, timeout_minutes: int = 5):
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ 你必須先加入一個語音頻道！", ephemeral=True)
+            return
+
+        # 檢查是否為 Bot Owner (支援 .env 之 OWNER_ID 與 Discord App Owner)
+        is_owner = (interaction.user.id == OWNER_ID) or (await self.bot.is_owner(interaction.user))
+
+        if timeout_minutes == 0:
+            if not is_owner:
+                await interaction.response.send_message(
+                    "❌ 「永不自動退出 (0 分鐘)」選項僅限 Bot 擁有者 (OWNER_ID) 設定！一般使用者可設定 5 至 30 分鐘。",
+                    ephemeral=True,
+                )
+                return
+        elif timeout_minutes < 5 or timeout_minutes > 30:
+            await interaction.response.send_message(
+                "❌ 閒置自動退出時間請設定在 5 至 30 分鐘之間（輸入 0 代表永不退出，僅限 Owner）。",
+                ephemeral=True,
+            )
+            return
+
+        voice_channel = interaction.user.voice.channel
+        guild_id = interaction.guild_id
+        player = self.get_player(guild_id)
+
+        permissions = voice_channel.permissions_for(interaction.guild.me)
+        if not permissions.connect or not permissions.speak:
+            await interaction.response.send_message("❌ 機器人缺少加入或在該語音頻道發言的權限！", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        if not player.voice_client or not player.voice_client.is_connected():
+            try:
+                player.voice_client = await voice_channel.connect(reconnect=True, self_deaf=True)
+            except Exception as e:
+                await interaction.followup.send(f"❌ 連線至語音頻道失敗: {e}")
+                return
+        elif player.voice_client.channel != voice_channel:
+            await player.voice_client.move_to(voice_channel)
+
+
+        player.idle_timeout_minutes = timeout_minutes
+
+        if timeout_minutes == 0:
+            self.cancel_idle_timer(player)
+            await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置退出模式設定為：**永不自動退出** ♾️")
+        else:
+            if not player.current_track and not player.queue:
+                self.start_idle_timer(player)
+            await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置自動退出時間設定為：**{timeout_minutes} 分鐘** ⏱️")
+
     @app_commands.command(name="leave", description="離開語音頻道")
     async def leave(self, interaction: discord.Interaction):
         await self.stop_player(interaction.guild_id)
         await interaction.response.send_message("👋 已離開語音頻道。")
+
 
     # 監聽 Voice State 異動 (成員離線與 Bot 被強制踢出處理)
     @commands.Cog.listener()

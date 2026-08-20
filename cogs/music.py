@@ -39,6 +39,17 @@ def build_progress_bar(elapsed: int, duration: int, total_length: int = 12) -> s
     return f"`{elapsed_str}` {bar} `{duration_str}`"
 
 
+# Cookie 路徑與內容自動檢測（支援本地 cookies.txt 或 .env 指定路徑/內容）
+COOKIE_PATH = os.getenv("YOUTUBE_COOKIE_PATH", "cookies.txt")
+COOKIES_TEXT = os.getenv("YOUTUBE_COOKIES_TEXT", "")
+
+if not os.path.exists(COOKIE_PATH) and COOKIES_TEXT.strip():
+    try:
+        with open(COOKIE_PATH, "w", encoding="utf-8") as f:
+            f.write(COOKIES_TEXT.strip() + "\n")
+    except Exception as e:
+        logger.warning(f"自動寫入 .env COOKIES_TEXT 失敗: {e}")
+
 # yt-dlp 最佳化設定：極致輕量化，只解析音訊，嚴禁下載與畫面處理，停用播放清單
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -51,13 +62,22 @@ YTDL_OPTIONS = {
     "no_warnings": True,
     "default_search": "auto",
     "source_address": "0.0.0.0",
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios", "mweb"]
+        }
+    },
 }
+
+if os.path.exists(COOKIE_PATH):
+    YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
 
 # FFmpeg 串流優化設定：啟用網路斷線自動重連，強制輸出 48kHz 雙聲道 PCM 防止音速/音調忽快忽慢
 FFMPEG_OPTIONS = {
     "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
     "options": "-vn -ar 48000 -ac 2",
 }
+
 
 
 @dataclass

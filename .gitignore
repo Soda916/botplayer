@@ -13,4 +13,7 @@ __pycache__/
 *.log
 storage/
 data/
+cookies.txt
+cookies*.txt
+
 AI_COLLAB_HANDOFF.md

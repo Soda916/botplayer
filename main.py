@@ -55,16 +55,36 @@ class MusicBot(commands.Bot):
 
     async def setup_hook(self):
         # 動態載入 cogs/ 目錄下所有模組
-        cogs_dir = os.path.join(os.path.dirname(__file__), "cogs")
-        if os.path.exists(cogs_dir):
-            for filename in sorted(os.listdir(cogs_dir)):
-                if filename.endswith(".py") and not filename.startswith("_"):
-                    cog_name = f"cogs.{filename[:-3]}"
+        from pathlib import Path
+        cogs_dir = Path(__file__).resolve().parent / "cogs"
+        modules = []
+
+        def find_extensions(directory: Path):
+            for path in sorted(directory.iterdir()):
+                if path.name.startswith("_") or path.name.startswith("."):
+                    continue
+                if path.is_dir():
+                    find_extensions(path)
+                elif path.is_file() and path.suffix == ".py":
+                    if path.stem == "__init__":
+                        continue
                     try:
-                        await self.load_extension(cog_name)
-                        logger.info(f"成功載入 Cog: {cog_name}")
-                    except Exception as e:
-                        logger.error(f"載入 Cog {cog_name} 失敗: {e}", exc_info=True)
+                        content = path.read_text(encoding="utf-8")
+                        if "def setup(" in content:
+                            rel_path = path.with_suffix("").relative_to(cogs_dir.parent)
+                            modules.append(".".join(rel_path.parts))
+                    except Exception:
+                        pass
+
+        if cogs_dir.exists():
+            find_extensions(cogs_dir)
+
+        for module in modules:
+            try:
+                await self.load_extension(module)
+                logger.info(f"成功載入 Cog: {module}")
+            except Exception as e:
+                logger.error(f"載入 Cog {module} 失敗: {e}", exc_info=True)
 
         # 同步 Slash Commands
         logger.info("正在同步 Slash Commands 至 Discord...")

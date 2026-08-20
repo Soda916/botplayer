@@ -70,5 +70,13 @@ botplayer/
   - 補齊 `test_idle_timeout_settings` 單元測試，通過 `compileall` 編譯與全部 4 項單元測試。
 - Next Relay:
   - 在 `.env` 設定 `OWNER_ID` 並在 Discord 測試伺服器測試 `/join` 各種參數與權限開關。
-
-
+### [2026-08-20] Entry #004
+- Maintainer: `dust_AgyGemini3.7flash(mid)`
+- Session Goal: 引入標準化 Hot Deploy 熱重載模組與遞迴 Cog 載入機制。
+- Scope: `main.py`, `cogs/deploy.py`, `AI_COLLAB_HANDOFF.md`
+- Delta:
+  - 新增 `cogs/deploy.py` 實作 `/hotdeploy` 指令，具備 `compileall` 語法預檢、自動回滾、巢狀 Cogs 支援與 `sys.modules` 快取刷新。
+  - 重構 `main.py` 的 `setup_hook` 支援遞迴尋找 `def setup(` 進入點動態載入 Cogs。
+  - 通過 `compileall` 編譯與全部 4 項單元測試。
+- Next Relay:
+  - 在 `.env` 設定 `DEPLOY_HASH` 後測試 `/hotdeploy` 指令。

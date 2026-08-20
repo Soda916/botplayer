@@ -50,5 +50,14 @@ botplayer/
   - 實作每伺服器獨立的待播佇列（Queue）與歷史播放記錄（History）。
   - 實作即時互動播放面板 `MusicControlView`（包含 ⏯️ 播放/暫停、⏭️ 下一首、⏮️ 上一首、⏹️ 停止/離開、📜 待播清單）。
   - 實作 e2-micro 資源防護：語音頻道閒置自動離線、`asyncio.to_thread` 防止 Event Loop 阻塞。
+### [2026-08-20] Entry #002
+- Maintainer: `dust_AgyGemini3.6flash(mid)`
+- Session Goal: 檢查並補齊 Discord 語音連線必備相依套件 (PyNaCl, davey) 與 libopus 跨平台自動載入機制。
+- Scope: `main.py`, `requirements.txt`, `AI_COLLAB_HANDOFF.md`
+- Delta:
+  - 於 `main.py` 補齊 `libopus` 自動檢測與載入機制 (`ctypes.util.find_library("opus")`)，確保不同作業系統環境 (macOS / Linux / GCP e2-micro) 皆可正常發聲。
+  - 確認 `requirements.txt` 已包含 `discord.py[voice]`，其自動帶入 `PyNaCl` (xsalsa20/xchacha20 語音封包加密) 與 `davey` (Discord 新版 DAVE 端對端語音加密協定)。
+  - 通過編譯與單元測試。
 - Next Relay:
-  - 在 `.env` 輸入 `DISCORD_TOKEN` 並啟動 Bot 測試斜線指令 `/play` 與控制面板互動。
+  - 於伺服器部署並測試語音頻道連線。
+

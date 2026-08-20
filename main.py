@@ -26,6 +26,19 @@ if not TOKEN:
     logger.critical("未找到 DISCORD_TOKEN 環境變數，請確認 .env 檔案設定！")
     sys.exit(1)
 
+# 自動檢測並載入 libopus (跨平台音訊解碼支援)
+import ctypes.util
+if not discord.opus.is_loaded():
+    try:
+        opus_path = ctypes.util.find_library("opus")
+        if opus_path:
+            discord.opus.load_opus(opus_path)
+            logger.info(f"成功自動載入 libopus: {opus_path}")
+        else:
+            logger.warning("未找到系統 libopus 函式庫，若無法發聲請確認是否安裝 libopus。")
+    except Exception as e:
+        logger.warning(f"嘗試載入 libopus 時發生例外: {e}")
+
 
 class MusicBot(commands.Bot):
     def __init__(self):

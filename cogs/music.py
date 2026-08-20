@@ -1,10 +1,11 @@
 import os
+import time
 import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import yt_dlp
 
@@ -12,6 +13,30 @@ logger = logging.getLogger("botplayer.music")
 
 # 從 .env 讀取 OWNER_ID (如未設定或無效則為 0)
 OWNER_ID = int(os.getenv("OWNER_ID", "0")) if os.getenv("OWNER_ID", "").isdigit() else 0
+
+
+def format_seconds(secs: int) -> str:
+    m, s = divmod(secs, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def build_progress_bar(elapsed: int, duration: int, total_length: int = 12) -> str:
+    """生成真實時間播放進度條 (格式: 01:23 ▬▬▬🔘▬▬▬▬▬▬ 03:45)"""
+    elapsed_str = format_seconds(elapsed)
+    if duration <= 0:
+        return f"`{elapsed_str}` 🔘" + "▬" * (total_length - 1) + " `直播/未知`"
+
+    duration_str = format_seconds(duration)
+    capped_elapsed = min(elapsed, duration)
+    ratio = max(0.0, min(capped_elapsed / duration, 1.0))
+
+    filled = int(ratio * (total_length - 1))
+    unfilled = (total_length - 1) - filled
+    bar = "▬" * filled + "🔘" + "▬" * unfilled
+    return f"`{elapsed_str}` {bar} `{duration_str}`"
 
 
 # yt-dlp 最佳化設定：極致輕量化，只解析音訊，嚴禁下載與畫面處理，停用播放清單
@@ -28,13 +53,10 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
 }
 
-# FFmpeg 串流優化設定：啟用網路斷線自動重連，僅輸入音訊流
+# FFmpeg 串流優化設定：啟用網路斷線自動重連，強制輸出 48kHz 雙聲道 PCM 防止音速/音調忽快忽慢
 FFMPEG_OPTIONS = {
-    "before_options": (
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
-        "-probesize 64000 -analyzeduration 0"
-    ),
-    "options": "-vn",  # 絕不安裝/處理影片畫面，節省 CPU 與 RAM
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn -ar 48000 -ac 2",
 }
 
 
@@ -83,9 +105,11 @@ class MusicControlView(discord.ui.View):
             return
 
         if vc.is_paused():
+            player.on_resume()
             vc.resume()
             await interaction.response.send_message("▶️ 已恢復播放音樂。", ephemeral=True)
         elif vc.is_playing():
+            player.on_pause()
             vc.pause()
             await interaction.response.send_message("⏸️ 已暫停播放音樂。", ephemeral=True)
         else:
@@ -144,12 +168,52 @@ class GuildPlayer:
         self.idle_timer_task: Optional[asyncio.Task] = None
         self.idle_timeout_minutes: int = 5  # 預設閒置 5 分鐘自動退出
 
+        # 進度條實時時間追蹤
+        self.track_start_time: float = 0.0
+        self.paused_time_total: float = 0.0
+        self.pause_start_time: Optional[float] = None
+
+    def get_elapsed_seconds(self) -> int:
+        if not self.current_track or not self.track_start_time:
+            return 0
+        if self.pause_start_time is not None:
+            elapsed = self.pause_start_time - self.track_start_time - self.paused_time_total
+        else:
+            elapsed = time.time() - self.track_start_time - self.paused_time_total
+        return max(0, int(elapsed))
+
+    def on_track_start(self):
+        self.track_start_time = time.time()
+        self.paused_time_total = 0.0
+        self.pause_start_time = None
+
+    def on_pause(self):
+        if self.pause_start_time is None:
+            self.pause_start_time = time.time()
+
+    def on_resume(self):
+        if self.pause_start_time is not None:
+            self.paused_time_total += (time.time() - self.pause_start_time)
+            self.pause_start_time = None
 
 
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.players: Dict[int, GuildPlayer] = {}
+        self.progress_loop.start()
+
+    def cog_unload(self):
+        self.progress_loop.cancel()
+
+    @tasks.loop(seconds=5)
+    async def progress_loop(self):
+        for guild_id, player in list(self.players.items()):
+            if player.voice_client and player.voice_client.is_playing():
+                try:
+                    await self.update_panel(guild_id)
+                except Exception:
+                    pass
 
     def get_player(self, guild_id: int) -> GuildPlayer:
         if guild_id not in self.players:
@@ -210,9 +274,12 @@ class MusicCog(commands.Cog):
         if player.voice_client and player.voice_client.is_paused():
             status = "⏸️ 已暫停"
 
+        elapsed = player.get_elapsed_seconds()
+        progress_bar = build_progress_bar(elapsed, track.duration)
+
         embed = discord.Embed(
             title="🎵 正在播放歌曲",
-            description=f"**[{track.title}]({track.url})**",
+            description=f"**[{track.title}]({track.url})**\n\n{progress_bar}",
             color=discord.Color.blue(),
         )
         embed.add_field(name="狀態", value=status, inline=True)
@@ -326,6 +393,7 @@ class MusicCog(commands.Cog):
                     pass
                 self.play_next_track(guild_id)
 
+            player.on_track_start()
             vc.play(source, after=after_playing)
             asyncio.run_coroutine_threadsafe(self.update_panel(guild_id), self.bot.loop)
         else:
@@ -382,26 +450,23 @@ class MusicCog(commands.Cog):
 
         player.idle_timer_task = self.bot.loop.create_task(idle_disconnect())
 
-
     def cancel_idle_timer(self, player: GuildPlayer):
         if player.idle_timer_task and not player.idle_timer_task.done():
             player.idle_timer_task.cancel()
             player.idle_timer_task = None
 
     async def stop_player(self, guild_id: int):
-        """清空佇列並斷開連線"""
+        """停止播放並清空待播清單（保持語音連線，啟動閒置倒數）"""
         player = self.get_player(guild_id)
         self.cancel_idle_timer(player)
         player.queue.clear()
         player.history.clear()
         player.current_track = None
 
-        if player.voice_client:
-            if player.voice_client.is_connected():
-                player.voice_client.stop()
-                await player.voice_client.disconnect()
-            player.voice_client = None
+        if player.voice_client and (player.voice_client.is_playing() or player.voice_client.is_paused()):
+            player.voice_client.stop()
 
+        self.start_idle_timer(player)
         await self.update_panel(guild_id)
 
     # ------------------ Slash Commands ------------------
@@ -452,8 +517,8 @@ class MusicCog(commands.Cog):
             # 目前空閒，直接開始播放
             player.queue.append(track)
             await interaction.followup.send(f"🎶 **開始播放**：[{track.title}]({track.url})")
-            await self.send_new_panel(guild_id, interaction.channel)
             self.play_next_track(guild_id)
+            await self.send_new_panel(guild_id, interaction.channel)
 
     @app_commands.command(name="skip", description="跳過當前正在播放的歌曲")
     async def skip(self, interaction: discord.Interaction):
@@ -480,6 +545,7 @@ class MusicCog(commands.Cog):
     async def pause(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild_id)
         if player.voice_client and player.voice_client.is_playing():
+            player.on_pause()
             player.voice_client.pause()
             await self.update_panel(interaction.guild_id)
             await interaction.response.send_message("⏸️ 已暫停播放。")
@@ -490,16 +556,17 @@ class MusicCog(commands.Cog):
     async def resume(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild_id)
         if player.voice_client and player.voice_client.is_paused():
+            player.on_resume()
             player.voice_client.resume()
             await self.update_panel(interaction.guild_id)
             await interaction.response.send_message("▶️ 已恢復播放。")
         else:
             await interaction.response.send_message("⚠️ 目前音樂沒有處於暫停狀態。", ephemeral=True)
 
-    @app_commands.command(name="stop", description="停止播放並清空待播清單與歷史")
+    @app_commands.command(name="stop", description="停止播放並清空待播清單")
     async def stop(self, interaction: discord.Interaction):
         await self.stop_player(interaction.guild_id)
-        await interaction.response.send_message("⏹️ 已停止播放並離開語音頻道。")
+        await interaction.response.send_message("⏹️ 已停止播放音樂並清空待播佇列。")
 
     @app_commands.command(name="queue", description="顯示當前待播清單 (Queue)")
     async def queue(self, interaction: discord.Interaction):
@@ -550,7 +617,6 @@ class MusicCog(commands.Cog):
         elif player.voice_client.channel != voice_channel:
             await player.voice_client.move_to(voice_channel)
 
-
         player.idle_timeout_minutes = timeout_minutes
 
         if timeout_minutes == 0:
@@ -563,9 +629,20 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="leave", description="離開語音頻道")
     async def leave(self, interaction: discord.Interaction):
-        await self.stop_player(interaction.guild_id)
-        await interaction.response.send_message("👋 已離開語音頻道。")
+        player = self.get_player(interaction.guild_id)
+        self.cancel_idle_timer(player)
+        player.queue.clear()
+        player.history.clear()
+        player.current_track = None
 
+        if player.voice_client:
+            if player.voice_client.is_connected():
+                player.voice_client.stop()
+                await player.voice_client.disconnect()
+            player.voice_client = None
+
+        await self.update_panel(interaction.guild_id)
+        await interaction.response.send_message("👋 已離開語音頻道。")
 
     # 監聽 Voice State 異動 (成員離線與 Bot 被強制踢出處理)
     @commands.Cog.listener()

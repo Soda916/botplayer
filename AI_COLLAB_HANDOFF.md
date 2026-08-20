@@ -78,5 +78,15 @@ botplayer/
   - 新增 `cogs/deploy.py` 實作 `/hotdeploy` 指令，具備 `compileall` 語法預檢、自動回滾、巢狀 Cogs 支援與 `sys.modules` 快取刷新。
   - 重構 `main.py` 的 `setup_hook` 支援遞迴尋找 `def setup(` 進入點動態載入 Cogs。
   - 通過 `compileall` 編譯與全部 4 項單元測試。
+### [2026-08-20] Entry #005
+- Maintainer: `dust_AgyGemini3.6flash(mid)`
+- Session Goal: 同步 `FFmpeg` 48kHz 音訊對齊、實時文字進度條與停止播放語音連線保持機制至 `botplayer`。
+- Scope: `cogs/music.py`, `AI_COLLAB_HANDOFF.md`
+- Delta:
+  - **修復播歌忽快忽慢 desync**：重構 `FFMPEG_OPTIONS` 加入 `-ar 48000 -ac 2` 強制輸出 48kHz 雙聲道 PCM，完美對齊 Discord 語音規格。
+  - **實時播放進度條**：於 `GuildPlayer` 引入動態時間追蹤與 `build_progress_bar()` 渲染器，並啟動 `progress_loop` 每 5 秒自動刷洗面板實時顯示進度。
+  - **停止播放不離線**：重構 `stop_player()` 與 `/stop`；點擊 `⏹️` 或執行 `/stop` 僅停播與清空佇列並保持語音頻道連線，將離開語音頻道邏輯隔離交由 `/leave` 或閒置逾時處理。
+  - 通過 `compileall` 編譯與全部 4 項單元測試。
 - Next Relay:
-  - 在 `.env` 設定 `DEPLOY_HASH` 後測試 `/hotdeploy` 指令。
+  - 於 e2-micro 環境測試 `botplayer` 音質穩定度與進度條面板顯示。
+

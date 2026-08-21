@@ -225,6 +225,175 @@ class MusicCog(commands.Cog):
 
     def cog_unload(self):
         self.progress_loop.cancel()
+        for player in self.players.values():
+            self.cancel_idle_timer(player)
+
+    def export_playback_state(self) -> dict:
+        """導出所有活躍伺服器的播放狀態與佇列資訊供熱重載接續"""
+        state = {}
+        for guild_id, player in self.players.items():
+            vc = player.voice_client
+            channel_id = vc.channel.id if (vc and vc.channel) else None
+            if not channel_id:
+                continue
+
+            current_dict = None
+            if player.current_track:
+                current_dict = {
+                    "title": player.current_track.title,
+                    "url": player.current_track.url,
+                    "stream_url": player.current_track.stream_url,
+                    "duration": player.current_track.duration,
+                    "thumbnail": player.current_track.thumbnail,
+                    "requester_id": player.current_track.requester.id if player.current_track.requester else None,
+                    "elapsed_seconds": player.get_elapsed_seconds(),
+                }
+
+            queue_list = [
+                {
+                    "title": t.title,
+                    "url": t.url,
+                    "stream_url": t.stream_url,
+                    "duration": t.duration,
+                    "thumbnail": t.thumbnail,
+                    "requester_id": t.requester.id if t.requester else None,
+                }
+                for t in player.queue
+            ]
+
+            history_list = [
+                {
+                    "title": t.title,
+                    "url": t.url,
+                    "stream_url": t.stream_url,
+                    "duration": t.duration,
+                    "thumbnail": t.thumbnail,
+                    "requester_id": t.requester.id if t.requester else None,
+                }
+                for t in player.history
+            ]
+
+            state[guild_id] = {
+                "voice_channel_id": channel_id,
+                "text_channel_id": player.text_channel.id if player.text_channel else None,
+                "is_playing": (vc.is_playing() if vc else False),
+                "is_paused": (vc.is_paused() if vc else False),
+                "current_track": current_dict,
+                "queue": queue_list,
+                "history": history_list,
+                "idle_timeout_minutes": player.idle_timeout_minutes,
+            }
+        return state
+
+    async def restore_playback_state(self, state: dict) -> None:
+        """根據 state 快照恢復語音連線與播放佇列"""
+        for guild_id, gdata in state.items():
+            guild = self.bot.get_guild(int(guild_id))
+            if not guild:
+                continue
+
+            voice_channel_id = gdata.get("voice_channel_id")
+            voice_channel = guild.get_channel(voice_channel_id) if voice_channel_id else None
+            if not voice_channel or not isinstance(voice_channel, (discord.VoiceChannel, discord.StageChannel)):
+                continue
+
+            player = self.get_player(guild.id)
+            player.idle_timeout_minutes = gdata.get("idle_timeout_minutes", 5)
+
+            text_channel_id = gdata.get("text_channel_id")
+            if text_channel_id:
+                txt_ch = guild.get_channel(text_channel_id)
+                if isinstance(txt_ch, discord.TextChannel):
+                    player.text_channel = txt_ch
+
+            try:
+                if not player.voice_client or not player.voice_client.is_connected():
+                    player.voice_client = await voice_channel.connect(reconnect=True, self_deaf=True)
+                elif player.voice_client.channel != voice_channel:
+                    await player.voice_client.move_to(voice_channel)
+            except Exception as e:
+                logger.error(f"恢復語音連線失敗 [Guild {guild.id}]: {e}")
+                continue
+
+            def make_track(tdict: dict) -> Track:
+                req_id = tdict.get("requester_id")
+                req_member = guild.get_member(req_id) if req_id else None
+                if not req_member:
+                    req_member = guild.me
+                return Track(
+                    title=tdict.get("title", "未知曲名"),
+                    url=tdict.get("url", ""),
+                    stream_url=tdict.get("stream_url", ""),
+                    duration=tdict.get("duration", 0),
+                    requester=req_member,
+                    thumbnail=tdict.get("thumbnail"),
+                )
+
+            player.history = [make_track(t) for t in gdata.get("history", [])]
+            player.queue = [make_track(t) for t in gdata.get("queue", [])]
+
+            curr_data = gdata.get("current_track")
+            was_playing = gdata.get("is_playing", False)
+            was_paused = gdata.get("is_paused", False)
+
+            if curr_data and (was_playing or was_paused):
+                curr_track = make_track(curr_data)
+                elapsed = curr_data.get("elapsed_seconds", 0)
+                self.play_track_with_offset(guild.id, curr_track, offset_seconds=elapsed, paused=was_paused)
+                if player.text_channel:
+                    try:
+                        await self.send_new_panel(guild.id, player.text_channel)
+                        await player.text_channel.send(f"🔄 **熱更新完成**：已自動接續播放 [{curr_track.title}]({curr_track.url})（從 `{curr_track.format_duration()}` 斷點接續）。")
+                    except Exception:
+                        pass
+            else:
+                self.start_idle_timer(player)
+
+    def play_track_with_offset(self, guild_id: int, track: Track, offset_seconds: int = 0, paused: bool = False):
+        """從指定秒數斷點接續播放歌曲"""
+        player = self.get_player(guild_id)
+        vc = player.voice_client
+        if not vc or not vc.is_connected():
+            return
+
+        self.cancel_idle_timer(player)
+        player.current_track = track
+
+        if offset_seconds > 0:
+            ffmpeg_before = f"-ss {offset_seconds} {FFMPEG_OPTIONS['before_options']}"
+        else:
+            ffmpeg_before = FFMPEG_OPTIONS['before_options']
+
+        try:
+            source = discord.FFmpegPCMAudio(
+                track.stream_url,
+                before_options=ffmpeg_before,
+                options=FFMPEG_OPTIONS["options"],
+            )
+
+            def after_playing(error):
+                if error:
+                    logger.error(f"FFmpeg 播放例外: {error}")
+                coro = self.update_panel(guild_id)
+                fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
+                try:
+                    fut.result(5)
+                except Exception:
+                    pass
+                self.play_next_track(guild_id)
+
+            player.on_track_start()
+            if offset_seconds > 0:
+                player.track_start_time = time.time() - offset_seconds
+
+            vc.play(source, after=after_playing)
+            if paused:
+                vc.pause()
+                player.on_pause()
+            asyncio.run_coroutine_threadsafe(self.update_panel(guild_id), self.bot.loop)
+        except Exception as e:
+            logger.error(f"斷點播放音訊失敗 [{track.title}]: {e}")
+            self.play_next_track(guild_id)
 
     @tasks.loop(seconds=5)
     async def progress_loop(self):

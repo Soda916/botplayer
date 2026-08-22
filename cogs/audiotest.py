@@ -273,12 +273,13 @@ class AudioTestCog(commands.Cog):
             stream_url = data.get("url")
             title = data.get("title", "未知曲名")
 
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-                await asyncio.sleep(0.1)
+            user_agent = data.get("http_headers", {}).get("User-Agent")
+            http_before = HTTP_BEFORE_OPTIONS
+            if user_agent:
+                http_before = f"-headers \"User-Agent: {user_agent}\\r\\n\" {HTTP_BEFORE_OPTIONS}"
 
-            # 強制帶入 -map 0:a:0，忽略影音混合檔(Format 18 MP4)之視訊軌，避開 CPU 雙核吃爆與開頭卡頓
-            source = discord.FFmpegPCMAudio(stream_url, before_options=HTTP_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
+            # 強制帶入 User-Agent 標頭與 -map 0:a:0，避免 YouTube 針對防盜鏈 HTTP 限速與丟套封包
+            source = discord.FFmpegPCMAudio(stream_url, before_options=http_before, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:

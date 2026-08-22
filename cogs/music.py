@@ -92,9 +92,11 @@ FFMPEG_OPTIONS = {
     "options": FFMPEG_OPTIONS_CLEAN,
 }
 
-def get_ffmpeg_before_options(stream_url: str, offset_seconds: int = 0) -> str:
+def get_ffmpeg_before_options(stream_url: str, offset_seconds: int = 0, user_agent: str = None) -> str:
     is_http = stream_url.startswith("http://") or stream_url.startswith("https://")
     base = FFMPEG_OPTIONS_HTTP if is_http else FFMPEG_OPTIONS_LOCAL
+    if is_http and user_agent:
+        base = f"-headers \"User-Agent: {user_agent}\\r\\n\" {base}"
     if offset_seconds > 0:
         return f"-ss {offset_seconds} {base}"
     return base

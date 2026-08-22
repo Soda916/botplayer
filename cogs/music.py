@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import asyncio
 import logging
 from dataclasses import dataclass
@@ -13,6 +14,9 @@ logger = logging.getLogger("botplayer.music")
 
 # 從 .env 讀取 OWNER_ID (如未設定或無效則為 0)
 OWNER_ID = int(os.getenv("OWNER_ID", "0")) if os.getenv("OWNER_ID", "").isdigit() else 0
+
+# 機器人訊息自動延時刪除秒數 (防訊息洗版，維持播放面板在底部)
+AUTO_DELETE_DELAY = 10.0
 
 
 def format_seconds(secs: int) -> str:
@@ -39,8 +43,12 @@ def build_progress_bar(elapsed: int, duration: int, total_length: int = 12) -> s
     return f"`{elapsed_str}` {bar} `{duration_str}`"
 
 
-# Cookie 路徑與內容自動檢測（支援本地 cookies.txt 或 .env 指定路徑/內容）
-COOKIE_PATH = os.getenv("YOUTUBE_COOKIE_PATH", "cookies.txt")
+
+
+# 相對專案根目錄解析絕對路徑，防範從不同 CWD 啟動時找不到 cookies.txt
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_COOKIE_PATH = os.path.join(BASE_DIR, "cookies.txt")
+COOKIE_PATH = os.getenv("YOUTUBE_COOKIE_PATH", DEFAULT_COOKIE_PATH)
 COOKIES_TEXT = os.getenv("YOUTUBE_COOKIES_TEXT", "")
 
 if not os.path.exists(COOKIE_PATH) and COOKIES_TEXT.strip():
@@ -56,7 +64,7 @@ YTDL_OPTIONS = {
     "extract_flat": False,
     "noplaylist": True,  # 嚴格不支援播放清單解析
     "nocheckcertificate": True,
-    "ignoreerrors": False,
+    "ignoreerrors": True,
     "logtostderr": False,
     "quiet": True,
     "no_warnings": True,
@@ -64,19 +72,22 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios", "mweb"]
+            "player_client": ["mweb", "web_creator", "tv", "ios", "android"]
         }
     },
 }
 
-if os.path.exists(COOKIE_PATH):
+if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
     YTDL_OPTIONS["cookiefile"] = COOKIE_PATH
 
-# FFmpeg 串流優化設定：啟用網路斷線自動重連，強制輸出 48kHz 雙聲道 PCM 防止音速/音調忽快忽慢
+
+
+# FFmpeg 串流優化設定：啟用斷線重連、1MB 快取緩衝、2秒特徵分析、aresample=48000:async=1 時間戳鎖定，徹底根治卡頓、忽快忽慢與提早進拍點
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -ar 48000 -ac 2",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 1M -analyzeduration 2000000",
+    "options": "-vn -f s16le -ar 48000 -ac 2 -af aresample=48000:async=1",
 }
+
 
 
 
@@ -132,6 +143,7 @@ class MusicControlView(discord.ui.View):
             player.on_pause()
             vc.pause()
             await interaction.response.send_message("⏸️ 已暫停播放音樂。", ephemeral=True)
+
         else:
             await interaction.response.send_message("⚠️ 目前沒有在播放音樂。", ephemeral=True)
 
@@ -177,21 +189,41 @@ class MusicControlView(discord.ui.View):
 
 
 class GuildPlayer:
-    def __init__(self, guild_id: int):
+    def __init__(self, guild_id: int, bot: Optional[commands.Bot] = None):
         self.guild_id: int = guild_id
+        self.bot: Optional[commands.Bot] = bot
+        self._voice_client: Optional[discord.VoiceClient] = None
         self.queue: List[Track] = []
         self.history: List[Track] = []
         self.current_track: Optional[Track] = None
-        self.voice_client: Optional[discord.VoiceClient] = None
         self.panel_message: Optional[discord.Message] = None
         self.text_channel: Optional[discord.TextChannel] = None
         self.idle_timer_task: Optional[asyncio.Task] = None
         self.idle_timeout_minutes: int = 5  # 預設閒置 5 分鐘自動退出
+        self.play_lock: asyncio.Lock = asyncio.Lock()  # 防並行點播競態衝堂鎖
+        self.connect_lock: asyncio.Lock = asyncio.Lock()  # Single-flight 語音連線防併發鎖
+
+        # 狀態機意圖追蹤 (Desired State)
+        self.desired_connected: bool = False
+        self.desired_channel_id: Optional[int] = None
 
         # 進度條實時時間追蹤
         self.track_start_time: float = 0.0
         self.paused_time_total: float = 0.0
         self.pause_start_time: Optional[float] = None
+
+    @property
+    def voice_client(self) -> Optional[discord.VoiceClient]:
+        """以 Discord Guild 即時 voice_client 為單一真實來源，防長連線與熱重載狀態脫節"""
+        if self.bot:
+            guild = self.bot.get_guild(self.guild_id)
+            if guild and guild.voice_client:
+                return guild.voice_client
+        return self._voice_client
+
+    @voice_client.setter
+    def voice_client(self, value: Optional[discord.VoiceClient]):
+        self._voice_client = value
 
     def get_elapsed_seconds(self) -> int:
         if not self.current_track or not self.track_start_time:
@@ -200,7 +232,10 @@ class GuildPlayer:
             elapsed = self.pause_start_time - self.track_start_time - self.paused_time_total
         else:
             elapsed = time.time() - self.track_start_time - self.paused_time_total
-        return max(0, int(elapsed))
+        elapsed_int = max(0, int(elapsed))
+        if self.current_track.duration > 0:
+            elapsed_int = min(elapsed_int, self.current_track.duration)
+        return elapsed_int
 
     def on_track_start(self):
         self.track_start_time = time.time()
@@ -217,6 +252,7 @@ class GuildPlayer:
             self.pause_start_time = None
 
 
+
 class MusicCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -227,6 +263,28 @@ class MusicCog(commands.Cog):
         self.progress_loop.cancel()
         for player in self.players.values():
             self.cancel_idle_timer(player)
+
+    @tasks.loop(seconds=5)
+    async def progress_loop(self):
+        """音樂播放進度條輪詢與語音連線看門狗 (Watchdog)"""
+        for guild_id, player in list(self.players.items()):
+            try:
+                vc = player.voice_client
+                # 1. 播放中即時進度條更新
+                if vc and vc.is_connected() and vc.is_playing():
+                    await self.update_panel(guild_id)
+                elif player.desired_connected and player.current_track:
+                    # 2. 連線異常/假死看門狗自癒 (Supervisor Watchdog)
+                    if not vc or not vc.is_connected():
+                        guild = self.bot.get_guild(guild_id)
+                        if guild and player.desired_channel_id:
+                            ch = guild.get_channel(player.desired_channel_id)
+                            if isinstance(ch, (discord.VoiceChannel, discord.StageChannel)):
+                                logger.info(f"Watchdog 偵測到 Guild {guild_id} 連線異常中斷，自動觸發連線自癒...")
+                                loop = asyncio.get_running_loop()
+                                loop.create_task(self.ensure_voice_connected(ch))
+            except Exception:
+                pass
 
     def export_playback_state(self) -> dict:
         """導出所有活躍伺服器的播放狀態與佇列資訊供熱重載接續"""
@@ -276,6 +334,8 @@ class MusicCog(commands.Cog):
             state[guild_id] = {
                 "voice_channel_id": channel_id,
                 "text_channel_id": player.text_channel.id if player.text_channel else None,
+                "desired_connected": player.desired_connected,
+                "desired_channel_id": player.desired_channel_id or channel_id,
                 "is_playing": (vc.is_playing() if vc else False),
                 "is_paused": (vc.is_paused() if vc else False),
                 "current_track": current_dict,
@@ -299,6 +359,8 @@ class MusicCog(commands.Cog):
 
             player = self.get_player(guild.id)
             player.idle_timeout_minutes = gdata.get("idle_timeout_minutes", 5)
+            player.desired_connected = gdata.get("desired_connected", True)
+            player.desired_channel_id = gdata.get("desired_channel_id", voice_channel.id)
 
             text_channel_id = gdata.get("text_channel_id")
             if text_channel_id:
@@ -307,10 +369,9 @@ class MusicCog(commands.Cog):
                     player.text_channel = txt_ch
 
             try:
-                if not player.voice_client or not player.voice_client.is_connected():
-                    player.voice_client = await voice_channel.connect(reconnect=True, self_deaf=True)
-                elif player.voice_client.channel != voice_channel:
-                    await player.voice_client.move_to(voice_channel)
+                vc = await self.ensure_voice_connected(voice_channel)
+                if not vc:
+                    continue
             except Exception as e:
                 logger.error(f"恢復語音連線失敗 [Guild {guild.id}]: {e}")
                 continue
@@ -343,7 +404,10 @@ class MusicCog(commands.Cog):
                 if player.text_channel:
                     try:
                         await self.send_new_panel(guild.id, player.text_channel)
-                        await player.text_channel.send(f"🔄 **熱更新完成**：已自動接續播放 [{curr_track.title}]({curr_track.url})（從 `{curr_track.format_duration()}` 斷點接續）。")
+                        await player.text_channel.send(
+                            f"🔄 **熱更新完成**：已自動接續播放 [{curr_track.title}]({curr_track.url})（從 `{curr_track.format_duration()}` 斷點接續）。",
+                            delete_after=AUTO_DELETE_DELAY,
+                        )
                     except Exception:
                         pass
             else:
@@ -364,6 +428,13 @@ class MusicCog(commands.Cog):
         else:
             ffmpeg_before = FFMPEG_OPTIONS['before_options']
 
+        # 如果前一首還在播放或停止中，等待舊音訊流釋放完畢
+        for _ in range(20):
+            if not (vc.is_playing() or vc.is_paused()):
+                break
+            vc.stop()
+            time.sleep(0.05)
+
         try:
             source = discord.FFmpegPCMAudio(
                 track.stream_url,
@@ -374,12 +445,6 @@ class MusicCog(commands.Cog):
             def after_playing(error):
                 if error:
                     logger.error(f"FFmpeg 播放例外: {error}")
-                coro = self.update_panel(guild_id)
-                fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
-                try:
-                    fut.result(5)
-                except Exception:
-                    pass
                 self.play_next_track(guild_id)
 
             player.on_track_start()
@@ -395,30 +460,159 @@ class MusicCog(commands.Cog):
             logger.error(f"斷點播放音訊失敗 [{track.title}]: {e}")
             self.play_next_track(guild_id)
 
-    @tasks.loop(seconds=5)
-    async def progress_loop(self):
-        for guild_id, player in list(self.players.items()):
-            if player.voice_client and player.voice_client.is_playing():
-                try:
-                    await self.update_panel(guild_id)
-                except Exception:
-                    pass
-
     def get_player(self, guild_id: int) -> GuildPlayer:
         if guild_id not in self.players:
-            self.players[guild_id] = GuildPlayer(guild_id)
+            self.players[guild_id] = GuildPlayer(guild_id, self.bot)
         return self.players[guild_id]
 
-    async def extract_yt_track(self, query: str, requester: discord.Member) -> Optional[Track]:
-        """使用 yt-dlp 非同步解析 YouTube 音訊網址 (僅解析音源，防阻塞)"""
+    async def ensure_voice_connected(self, voice_channel: discord.VoiceChannel, max_retries: int = 3) -> Optional[discord.VoiceClient]:
+        """
+        語音連線 Supervisor：確保語音連線符合 desired_state。
+        具備 Single-Flight 防併發鎖、Non-recoverable 權限熔斷、與 Exponential Backoff + Jitter 指數退避機制。
+        """
+        guild = voice_channel.guild
+        player = self.get_player(guild.id)
+
+        # 1. Non-recoverable 權限與頻道存在性先驗檢查 (Fail-Fast 熔斷防死循環)
+        if not guild.me:
+            logger.error(f"Guild {guild.id} 找不到 Bot 成員，無法建立語音連線。")
+            player.desired_connected = False
+            return None
+
+        perms = voice_channel.permissions_for(guild.me)
+        if not perms.connect:
+            logger.warning(f"缺少語音頻道 [{voice_channel.name}] 的 Connect 連線權限，放棄重連。")
+            player.desired_connected = False
+            return None
+
+        # 2. Single-Flight 併發鎖：防止多個事件/指令同時觸發多重連線
+        async with player.connect_lock:
+            player.desired_connected = True
+            player.desired_channel_id = voice_channel.id
+
+            vc = guild.voice_client
+
+            # 若連線健康活躍且已在目標頻道
+            if vc and isinstance(vc, discord.VoiceClient) and vc.is_connected():
+                if vc.channel != voice_channel:
+                    try:
+                        await vc.move_to(voice_channel)
+                    except Exception as e:
+                        logger.warning(f"移動至語音頻道失敗 [{voice_channel.name}]: {e}")
+
+                if isinstance(voice_channel, discord.StageChannel):
+                    try:
+                        if guild.me.voice and guild.me.voice.suppressed:
+                            await guild.me.edit(suppress=False)
+                    except Exception as e:
+                        logger.warning(f"Stage 頻道申請開麥發言失敗: {e}")
+                return vc
+
+            # 3. 徹底清理失效/殭屍舊連線
+            if vc:
+                try:
+                    if vc.is_playing() or vc.is_paused():
+                        vc.stop()
+                    await vc.disconnect(force=True)
+                except Exception as e:
+                    logger.warning(f"強制中斷失效語音連線失敗: {e}")
+                await asyncio.sleep(0.2)
+
+            # 4. 指數退避與抖動重試 (Exponential Backoff + Jitter)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logger.info(f"正在建立語音連線 [Guild {guild.id} -> {voice_channel.name}] (嘗試 #{attempt})...")
+                    vc = await voice_channel.connect(reconnect=True, self_deaf=True, timeout=15.0)
+
+                    if isinstance(voice_channel, discord.StageChannel) and guild.me:
+                        try:
+                            if guild.me.voice and guild.me.voice.suppressed:
+                                await guild.me.edit(suppress=False)
+                        except Exception:
+                            pass
+
+                    logger.info(f"語音連線成功建立 [Guild {guild.id}]。")
+                    return vc
+                except Exception as e:
+                    logger.warning(f"語音連線嘗試 #{attempt} 失敗: {e}")
+                    if guild.voice_client:
+                        try:
+                            await guild.voice_client.disconnect(force=True)
+                        except Exception:
+                            pass
+
+                    if attempt < max_retries:
+                        # 指數退避: 1s, 2s, 4s + 0.1~0.5s Jitter 抖動防雪崩
+                        backoff = (2 ** (attempt - 1)) + random.uniform(0.1, 0.5)
+                        logger.info(f"等待 {backoff:.2f} 秒後進行下一次連線重試...")
+                        await asyncio.sleep(backoff)
+
+            logger.error(f"達到最大重試次數 ({max_retries})，建立語音連線失敗 [Guild {guild.id}]。")
+            return None
+
+    async def extract_yt_tracks(self, query: str, requester: discord.Member) -> List[Track]:
+        """使用 yt-dlp 非同步極速解壓網址 (支援單曲與播放清單 Rapid Flat Unpacking，防卡死)"""
         loop = asyncio.get_running_loop()
 
         def fetch():
-            with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ytdl:
+            opts = YTDL_OPTIONS.copy()
+            opts["extract_flat"] = True
+            opts["noplaylist"] = False
+            with yt_dlp.YoutubeDL(opts) as ytdl:
                 info = ytdl.extract_info(query, download=False)
                 if not info:
+                    return []
+                if "entries" in info:
+                    entries = [e for e in info["entries"] if e]
+                    return entries
+                return [info]
+
+        try:
+            data_list = await loop.run_in_executor(None, fetch)
+            if not data_list:
+                return []
+
+            tracks = []
+            for data in data_list:
+                url = data.get("webpage_url") or data.get("url")
+                if not url and data.get("id"):
+                    url = f"https://www.youtube.com/watch?v={data.get('id')}"
+                if not url:
+                    continue
+
+                title = data.get("title", "未知曲名")
+                stream_url = data.get("url") if not data.get("is_flat", True) else ""
+
+                tracks.append(
+                    Track(
+                        title=title,
+                        url=url,
+                        stream_url=stream_url or "",
+                        duration=int(data.get("duration", 0)),
+                        requester=requester,
+                        thumbnail=data.get("thumbnail"),
+                    )
+                )
+            return tracks
+        except Exception as e:
+            logger.error(f"解析音訊清單失敗 [{query}]: {e}")
+            return []
+
+    async def resolve_stream_url(self, track: Track) -> Optional[Track]:
+        """即時 (On-Demand) 解析單曲的 FFmpeg 音訊串流網址"""
+        if track.stream_url:
+            return track
+
+        loop = asyncio.get_running_loop()
+
+        def fetch():
+            opts = YTDL_OPTIONS.copy()
+            opts["noplaylist"] = True
+            opts["extract_flat"] = False
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(track.url, download=False)
+                if not info:
                     return None
-                # 若因搜尋或傳入清單而返回 entries，強行只取第一首
                 if "entries" in info:
                     entries = [e for e in info["entries"] if e]
                     if not entries:
@@ -428,24 +622,21 @@ class MusicCog(commands.Cog):
 
         try:
             data = await loop.run_in_executor(None, fetch)
-            if not data:
+            if not data or not data.get("url"):
                 return None
 
-            stream_url = data.get("url")
-            if not stream_url:
-                return None
-
-            return Track(
-                title=data.get("title", "未知曲名"),
-                url=data.get("webpage_url", query),
-                stream_url=stream_url,
-                duration=int(data.get("duration", 0)),
-                requester=requester,
-                thumbnail=data.get("thumbnail"),
-            )
+            track.stream_url = data.get("url")
+            if not track.title or track.title == "未知曲名":
+                track.title = data.get("title", track.title)
+            if not track.duration:
+                track.duration = int(data.get("duration", 0))
+            if not track.thumbnail:
+                track.thumbnail = data.get("thumbnail")
+            return track
         except Exception as e:
-            logger.error(f"解析音訊失敗 [{query}]: {e}")
+            logger.error(f"即時解析歌曲串流網址失敗 [{track.url}]: {e}")
             return None
+
 
     def build_panel_embed(self, guild_id: int) -> discord.Embed:
         player = self.get_player(guild_id)
@@ -487,6 +678,7 @@ class MusicCog(commands.Cog):
 
         embed.set_footer(text="GCP e2-micro 輕量播放模式 | 僅解析 YouTube 音源")
         return embed
+
 
     def build_queue_embed(self, guild_id: int) -> discord.Embed:
         player = self.get_player(guild_id)
@@ -549,47 +741,130 @@ class MusicCog(commands.Cog):
             logger.error(f"發送播放面板失敗: {e}")
 
     def play_next_track(self, guild_id: int):
-        """內部播放迴圈關鍵點：播放完畢後的叫用"""
+        """內部播放迴圈排程觸發點 (支援安全事件迴圈叫用與異常捕獲)"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.play_next_track_async(guild_id))
+        except RuntimeError:
+            asyncio.run_coroutine_threadsafe(self.play_next_track_async(guild_id), self.bot.loop)
+
+    async def play_next_track_async(self, guild_id: int):
+        """即時解鎖音源並播放下一首歌曲 (支援開關防卡死自動跳過、連線自癒與並行鎖防衝堂)"""
         player = self.get_player(guild_id)
-        vc = player.voice_client
 
-        if not vc or not vc.is_connected():
-            return
+        async with player.play_lock:
+            vc = player.voice_client
 
-        # 把當前歌曲推進 history
-        if player.current_track:
-            player.history.append(player.current_track)
-            if len(player.history) > 20:  # 限制歷史紀錄上限以節省 RAM
-                player.history.pop(0)
+            # 若連線失效但有待播歌曲且有記錄的頻道，嘗試自癒連線
+            if not vc or not vc.is_connected():
+                guild = self.bot.get_guild(guild_id)
+                if guild and player.queue:
+                    target_channel = (vc.channel if vc and vc.channel else None)
+                    if not target_channel:
+                        req = player.queue[0].requester
+                        if req and hasattr(req, "voice") and req.voice and req.voice.channel:
+                            target_channel = req.voice.channel
+                    if target_channel:
+                        logger.info(f"偵測到 Guild {guild_id} 語音連線失效，執行播放前連線自癒...")
+                        vc = await self.ensure_voice_connected(target_channel)
 
-        # 佇列有下一首
-        if player.queue:
-            self.cancel_idle_timer(player)
-            next_track = player.queue.pop(0)
-            player.current_track = next_track
+            if not vc or not vc.is_connected():
+                logger.warning(f"Guild {guild_id} 無法取得有效語音連線，停止播放。")
+                return
 
-            source = discord.FFmpegPCMAudio(next_track.stream_url, **FFMPEG_OPTIONS)
+            # 把當前歌曲推進 history
+            if player.current_track:
+                player.history.append(player.current_track)
+                if len(player.history) > 20:  # 限制歷史紀錄上限以節省 RAM
+                    player.history.pop(0)
 
-            def after_playing(error):
-                if error:
-                    logger.error(f"FFmpeg 播放例外: {error}")
-                # 使用 loop 安全調用下一次播放
-                coro = self.update_panel(guild_id)
-                fut = asyncio.run_coroutine_threadsafe(coro, self.bot.loop)
+            while player.queue:
+                next_track = player.queue.pop(0)
+                resolved_track = await self.resolve_stream_url(next_track)
+                if not resolved_track:
+                    logger.warning(f"跳過無法解析音訊的歌曲: {next_track.title} ({next_track.url})")
+                    continue
+
+                self.cancel_idle_timer(player)
+                player.current_track = resolved_track
+
+                # 如果前一首還在播放或停止中，等待舊音訊流完全釋放，防 ClientException: Already playing audio 衝堂
+                for _ in range(20):
+                    if not (vc.is_playing() or vc.is_paused()):
+                        break
+                    vc.stop()
+                    await asyncio.sleep(0.05)
+
                 try:
-                    fut.result(5)
+                    # 預熱發送 5 秒 Discord 靜音 Opus 幀 (250 幀, 每幀 20ms)，為 e2-micro 與 Standard Network 徹底打通 SSRC 通道，防止歌曲開頭 5~7 秒被卡掉
+                    if hasattr(vc, "send_audio_packet"):
+                        try:
+                            for _ in range(250):
+                                vc.send_audio_packet(b"\xF8\xFF\xFE", encode=False)
+                                await asyncio.sleep(0.02)
+                        except Exception:
+                            pass
+
+                    source = discord.FFmpegPCMAudio(resolved_track.stream_url, **FFMPEG_OPTIONS)
+
+                    def after_playing(error):
+                        if error:
+                            logger.error(f"FFmpeg 播放例外: {error}")
+                        self.play_next_track(guild_id)
+
+                    player.on_track_start()
+                    vc.play(source, after=after_playing)
+                    await self.update_panel(guild_id)
+
+                    # 觸發下一首歌曲背景非同步預載解析 (Preloading)，消除曲目切換延遲
+                    if player.queue:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self.preload_next_track(guild_id))
+
+                    return
+                except Exception as e:
+                    logger.error(f"播放歌曲失敗 [{resolved_track.title}]: {e}")
+                    continue
+
+            # 無待播歌曲：進入播畢收尾狀態 (顯示 5 秒播畢面板後清空並切換至待機模式)
+            last_track = player.current_track
+            player.current_track = None
+
+            if last_track and player.panel_message:
+                try:
+                    embed = discord.Embed(
+                        title="✅ 歌曲播放完畢",
+                        description=f"**[{last_track.title}]({last_track.url})**\n\n`{last_track.format_duration()}` ▬▬▬▬▬▬▬▬▬▬🔘 `{last_track.format_duration()}`",
+                        color=discord.Color.green(),
+                    )
+                    embed.add_field(name="狀態", value="🏁 佇列已播畢", inline=True)
+                    embed.add_field(name="長度", value=last_track.format_duration(), inline=True)
+                    embed.add_field(name="點歌者", value=last_track.requester.mention, inline=True)
+                    embed.add_field(name="待播佇列", value="共 `0` 首歌曲等待中", inline=False)
+                    if last_track.thumbnail:
+                        embed.set_thumbnail(url=last_track.thumbnail)
+                    embed.set_footer(text="GCP e2-micro 輕量播放模式 | 5 秒後切換至待機面板")
+                    view = MusicControlView(self, guild_id)
+                    await player.panel_message.edit(embed=embed, view=view)
                 except Exception:
                     pass
-                self.play_next_track(guild_id)
 
-            player.on_track_start()
-            vc.play(source, after=after_playing)
-            asyncio.run_coroutine_threadsafe(self.update_panel(guild_id), self.bot.loop)
-        else:
-            # 無待播歌曲，進入閒置狀態並啟動自動斷線計時器 (3分鐘)
-            player.current_track = None
-            asyncio.run_coroutine_threadsafe(self.update_panel(guild_id), self.bot.loop)
+                await asyncio.sleep(5.0)
+
+            # 5 秒後徹底清空並切換至空閒待機面板
+            await self.update_panel(guild_id)
             self.start_idle_timer(player)
+
+    async def preload_next_track(self, guild_id: int):
+        """背景非同步預先解析佇列下一首歌的音訊串流網址 (預載加速)，消除換歌卡頓"""
+        player = self.get_player(guild_id)
+        if player.queue:
+            next_track = player.queue[0]
+            if not next_track.stream_url:
+                try:
+                    await self.resolve_stream_url(next_track)
+                except Exception as e:
+                    logger.warning(f"預載下一首歌曲失敗 [{next_track.title}]: {e}")
 
     async def play_previous(self, guild_id: int) -> bool:
         """播放上一首歌曲"""
@@ -629,11 +904,15 @@ class MusicCog(commands.Cog):
             if player.voice_client and player.voice_client.is_connected():
                 if not player.current_track and not player.queue:
                     logger.info(f"Guild {player.guild_id} 閒置超過 {player.idle_timeout_minutes} 分鐘，自動斷開語音連線以省資源。")
-                    await player.voice_client.disconnect()
-                    player.voice_client = None
+                    player.desired_connected = False
+                    player.desired_channel_id = None
+                    await player.voice_client.disconnect(force=True)
                     if player.text_channel:
                         try:
-                            await player.text_channel.send(f"💤 佇列已空且閒置超過 {player.idle_timeout_minutes} 分鐘，已自動離開語音頻道以節省系統資源。")
+                            await player.text_channel.send(
+                                f"💤 佇列已空且閒置超過 {player.idle_timeout_minutes} 分鐘，已自動離開語音頻道以節省系統資源。",
+                                delete_after=AUTO_DELETE_DELAY,
+                            )
                         except Exception:
                             pass
 
@@ -658,6 +937,7 @@ class MusicCog(commands.Cog):
         self.start_idle_timer(player)
         await self.update_panel(guild_id)
 
+
     # ------------------ Slash Commands ------------------
 
     @app_commands.command(name="play", description="播放 YouTube 音樂 (僅解析音效，不包含畫面/播放清單)")
@@ -679,35 +959,46 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer(thinking=True)
 
-        # 確保連線至語音頻道
-        if not player.voice_client or not player.voice_client.is_connected():
-            try:
-                player.voice_client = await voice_channel.connect(reconnect=True, self_deaf=True)
-            except Exception as e:
-                await interaction.followup.send(f"❌ 連線至語音頻道失敗: {e}")
-                return
-        elif player.voice_client.channel != voice_channel:
-            await player.voice_client.move_to(voice_channel)
-
-        # 解析音訊
-        track = await self.extract_yt_track(query, interaction.user)
-        if not track:
-            await interaction.followup.send("❌ 無法解析該網址或搜尋結果，請確認輸入有效 YouTube 連結或關鍵字。")
+        # 確保連線至語音頻道 (自動自癒與重連)
+        vc = await self.ensure_voice_connected(voice_channel)
+        if not vc:
+            msg = await interaction.followup.send("❌ 連線至語音頻道失敗，請確認機器人權限或稍後重試。")
+            await msg.delete(delay=AUTO_DELETE_DELAY)
             return
 
-        if player.voice_client.is_playing() or player.voice_client.is_paused():
-            # 正在播放中，加入待播清單 (Queue)
-            player.queue.append(track)
-            await interaction.followup.send(
-                f"✅ **已加入待播清單**：[{track.title}]({track.url}) (佇列位置: #{len(player.queue)})"
-            )
+        # 解析音訊 (支援單曲與播放清單極速解壓)
+        tracks = await self.extract_yt_tracks(query, interaction.user)
+        if not tracks:
+            msg = await interaction.followup.send("❌ 無法解析該網址或搜尋結果，請確認輸入有效 YouTube 連結或關鍵字。")
+            await msg.delete(delay=AUTO_DELETE_DELAY)
+            return
+
+        if (player.voice_client and (player.voice_client.is_playing() or player.voice_client.is_paused())) or player.current_track:
+            # 正在播放或有曲目鎖定中，加入待播清單 (Queue)
+            player.queue.extend(tracks)
+            if len(tracks) == 1:
+                msg = await interaction.followup.send(
+                    f"✅ **已加入待播清單**：[{tracks[0].title}]({tracks[0].url}) (佇列位置: #{len(player.queue)})"
+                )
+            else:
+                msg = await interaction.followup.send(
+                    f"✅ **已加入播放清單**：成功新增 `{len(tracks)}` 首歌曲至待播佇列！"
+                )
+            await msg.delete(delay=AUTO_DELETE_DELAY)
             await self.update_panel(guild_id)
         else:
             # 目前空閒，直接開始播放
-            player.queue.append(track)
-            await interaction.followup.send(f"🎶 **開始播放**：[{track.title}]({track.url})")
-            self.play_next_track(guild_id)
+            player.queue.extend(tracks)
+            if len(tracks) == 1:
+                msg = await interaction.followup.send(f"🎶 **開始播放**：[{tracks[0].title}]({tracks[0].url})")
+            else:
+                msg = await interaction.followup.send(
+                    f"🎶 **開始播放播放清單**：首曲 [{tracks[0].title}]({tracks[0].url})（共 `{len(tracks)}` 首）"
+                )
+            await msg.delete(delay=AUTO_DELETE_DELAY)
             await self.send_new_panel(guild_id, interaction.channel)
+            self.play_next_track(guild_id)
+
 
     @app_commands.command(name="skip", description="跳過當前正在播放的歌曲")
     async def skip(self, interaction: discord.Interaction):
@@ -719,16 +1010,17 @@ class MusicCog(commands.Cog):
             return
 
         vc.stop()
-        await interaction.response.send_message("⏭️ 已跳過當前歌曲。")
+        await interaction.response.send_message("⏭️ 已跳過當前歌曲。", delete_after=AUTO_DELETE_DELAY)
 
     @app_commands.command(name="prev", description="播放上一首歌曲")
     async def prev(self, interaction: discord.Interaction):
         await interaction.response.defer()
         success = await self.play_previous(interaction.guild_id)
         if success:
-            await interaction.followup.send("⏮️ 已切換至上一首歌曲。")
+            msg = await interaction.followup.send("⏮️ 已切換至上一首歌曲。")
         else:
-            await interaction.followup.send("⚠️ 沒有上一首播放紀錄！")
+            msg = await interaction.followup.send("⚠️ 沒有上一首播放紀錄！")
+        await msg.delete(delay=AUTO_DELETE_DELAY)
 
     @app_commands.command(name="pause", description="暫停播放音樂")
     async def pause(self, interaction: discord.Interaction):
@@ -737,7 +1029,7 @@ class MusicCog(commands.Cog):
             player.on_pause()
             player.voice_client.pause()
             await self.update_panel(interaction.guild_id)
-            await interaction.response.send_message("⏸️ 已暫停播放。")
+            await interaction.response.send_message("⏸️ 已暫停播放。", delete_after=AUTO_DELETE_DELAY)
         else:
             await interaction.response.send_message("⚠️ 目前沒有正在播放的音樂。", ephemeral=True)
 
@@ -748,19 +1040,20 @@ class MusicCog(commands.Cog):
             player.on_resume()
             player.voice_client.resume()
             await self.update_panel(interaction.guild_id)
-            await interaction.response.send_message("▶️ 已恢復播放。")
+            await interaction.response.send_message("▶️ 已恢復播放。", delete_after=AUTO_DELETE_DELAY)
         else:
             await interaction.response.send_message("⚠️ 目前音樂沒有處於暫停狀態。", ephemeral=True)
+
 
     @app_commands.command(name="stop", description="停止播放並清空待播清單")
     async def stop(self, interaction: discord.Interaction):
         await self.stop_player(interaction.guild_id)
-        await interaction.response.send_message("⏹️ 已停止播放音樂並清空待播佇列。")
+        await interaction.response.send_message("⏹️ 已停止播放音樂並清空待播佇列。", delete_after=AUTO_DELETE_DELAY)
 
     @app_commands.command(name="queue", description="顯示當前待播清單 (Queue)")
     async def queue(self, interaction: discord.Interaction):
         embed = self.build_queue_embed(interaction.guild_id)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, delete_after=AUTO_DELETE_DELAY)
 
     @app_commands.command(name="join", description="加入語音頻道並設定閒置自動退出時間")
     @app_commands.describe(timeout_minutes="閒置自動退出時間 (5-30 分鐘；輸入 0 代表永不退出 [僅 Owner 可設])")
@@ -797,28 +1090,29 @@ class MusicCog(commands.Cog):
 
         await interaction.response.defer()
 
-        if not player.voice_client or not player.voice_client.is_connected():
-            try:
-                player.voice_client = await voice_channel.connect(reconnect=True, self_deaf=True)
-            except Exception as e:
-                await interaction.followup.send(f"❌ 連線至語音頻道失敗: {e}")
-                return
-        elif player.voice_client.channel != voice_channel:
-            await player.voice_client.move_to(voice_channel)
+        # 確保連線至語音頻道 (自動自癒與重連)
+        vc = await self.ensure_voice_connected(voice_channel)
+        if not vc:
+            msg = await interaction.followup.send("❌ 連線至語音頻道失敗，請稍後再試。")
+            await msg.delete(delay=AUTO_DELETE_DELAY)
+            return
 
         player.idle_timeout_minutes = timeout_minutes
 
         if timeout_minutes == 0:
             self.cancel_idle_timer(player)
-            await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置退出模式設定為：**永不自動退出** ♾️")
+            msg = await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置退出模式設定為：**永不自動退出** ♾️")
         else:
             if not player.current_track and not player.queue:
                 self.start_idle_timer(player)
-            await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置自動退出時間設定為：**{timeout_minutes} 分鐘** ⏱️")
+            msg = await interaction.followup.send(f"🔊 已加入語音頻道 **{voice_channel.name}**！閒置自動退出時間設定為：**{timeout_minutes} 分鐘** ⏱️")
+        await msg.delete(delay=AUTO_DELETE_DELAY)
 
     @app_commands.command(name="leave", description="離開語音頻道")
     async def leave(self, interaction: discord.Interaction):
         player = self.get_player(interaction.guild_id)
+        player.desired_connected = False
+        player.desired_channel_id = None
         self.cancel_idle_timer(player)
         player.queue.clear()
         player.history.clear()
@@ -827,37 +1121,61 @@ class MusicCog(commands.Cog):
         if player.voice_client:
             if player.voice_client.is_connected():
                 player.voice_client.stop()
-                await player.voice_client.disconnect()
-            player.voice_client = None
+                await player.voice_client.disconnect(force=True)
 
         await self.update_panel(interaction.guild_id)
-        await interaction.response.send_message("👋 已離開語音頻道。")
+        await interaction.response.send_message("👋 已離開語音頻道。", delete_after=AUTO_DELETE_DELAY)
 
-    # 監聽 Voice State 異動 (成員離線與 Bot 被強制踢出處理)
+
+    # 監聽 Voice State 異動 (成員離線、頻道移動與 Bot 被踢出處理)
     @commands.Cog.listener()
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        guild = member.guild
+        player = self.get_player(guild.id)
+
+        # 1. 機器人自身狀態異動處理
         if member.id == self.bot.user.id:
             # Bot 被踢出語音頻道或斷線
             if before.channel and not after.channel:
-                player = self.get_player(member.guild.id)
-                player.voice_client = None
+                logger.info(f"Guild {guild.id} 機器人已離開語音頻道。")
+                player.desired_connected = False
+                player.desired_channel_id = None
                 player.current_track = None
                 player.queue.clear()
                 self.cancel_idle_timer(player)
                 await self.update_panel(member.guild.id)
-            return
+                return
 
-        # 若語音頻道中只剩下 Bot 人口 (其他成員全部離開)
-        guild = member.guild
-        player = self.get_player(guild.id)
+            # Bot 被管理員移動至其他語音頻道
+            if before.channel and after.channel and before.channel != after.channel:
+                logger.info(f"Guild {guild.id} 機器人被移動至頻道 {after.channel.name}")
+                player.desired_channel_id = after.channel.id
+                human_members = [m for m in after.channel.members if not m.bot]
+                if len(human_members) == 0:
+                    self.start_idle_timer(player)
+                else:
+                    if player.current_track or player.queue:
+                        self.cancel_idle_timer(player)
+                return
+
+        # 2. 其他成員人口異動處理
         vc = player.voice_client
-
         if vc and vc.is_connected() and vc.channel:
-            # 過濾掉 Bot 成員
             human_members = [m for m in vc.channel.members if not m.bot]
             if len(human_members) == 0:
                 logger.info(f"Guild {guild.id} 語音頻道內已無真實成員，自動開啟斷線倒數。")
                 self.start_idle_timer(player)
+            else:
+                # 若成員重新進入語音頻道，且有歌曲正在播放或佇列中，取消閒置倒數
+                if player.current_track or player.queue:
+                    self.cancel_idle_timer(player)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild):
+        """當 Bot 被移出伺服器時，清理記憶體狀態以防 Memory Leak"""
+        player = self.players.pop(guild.id, None)
+        if player:
+            self.cancel_idle_timer(player)
 
 
 async def setup(bot: commands.Bot):

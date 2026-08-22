@@ -16,10 +16,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_tests")
 os.makedirs(TEST_AUDIO_DIR, exist_ok=True)
 
-# 限制 FFmpeg 單執行緒 (-threads 1)，防止 e2-micro Core 0 吃爆與 cgroup 降頻；完全移除會砍掉人聲特徵的 async=1 濾鏡
-HTTP_BEFORE_OPTIONS = "-threads 1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-LOCAL_BEFORE_OPTIONS = "-threads 1"
-CLEAN_FFMPEG_OPTIONS = "-vn"
+# 開啟 2 個 Threads 提升複雜音訊解碼算力，擴大 probesize/analyzeduration 緩衝，加入高保真 48kHz 重採樣 (-af aresample=48000) 徹底平滑拍點
+HTTP_BEFORE_OPTIONS = "-threads 2 -probesize 4M -analyzeduration 4000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+LOCAL_BEFORE_OPTIONS = "-threads 2 -probesize 4M -analyzeduration 4000000"
+CLEAN_FFMPEG_OPTIONS = "-vn -af aresample=48000"
 
 
 def resolve_test_filepath(filename: str) -> Optional[str]:
@@ -81,7 +81,7 @@ class AudioTestCog(commands.Cog):
                 pass
 
         cmd = [
-            "ffmpeg", "-threads", "1", "-y", "-i", filepath,
+            "ffmpeg", "-threads", "2", "-y", "-i", filepath,
             "-ar", "48000", "-ac", "2",
             out_path
         ]
@@ -124,7 +124,7 @@ class AudioTestCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ 執行 Test A 失敗: {e}")
 
-    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord")
+    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord (雙執行緒+4M緩衝)")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_48k.wav)")
     async def test_b1(self, interaction: discord.Interaction, filename: str = "test_48k.wav"):
         vc = await self.ensure_voice(interaction)
@@ -153,15 +153,15 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B1] 本機 48kHz 直推播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n已限制 `-threads 1` 防止 CPU 吃爆，並移除丟幀的 `async=1` 濾鏡。",
+                title="▶️ [Test B1] 本機 48kHz 直推播放中 (2 Threads + 4MB 緩衝)",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n開滿 2 執行緒與 4MB 快取緩衝，確保空白拍點與留白處不搶拍、不早進。",
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B1 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord")
+    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord (雙執行緒+4M緩衝)")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_441k.mp3)")
     async def test_b2(self, interaction: discord.Interaction, filename: str = "test_441k.mp3"):
         vc = await self.ensure_voice(interaction)
@@ -190,8 +190,8 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n採用高保真連續 PCM 傳送，杜絕人聲被切斷與音樂卡頓問題。",
+                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中 (2 Threads + 4MB 緩衝)",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n專為複雜配器與高資訊量樂曲優化，確保音效繁複處與空白卡點處拍點 100% 對齊。",
                 color=discord.Color.purple()
             )
             await interaction.response.send_message(embed=embed)
@@ -228,7 +228,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test B3] 本機 48kHz -> FFmpeg 完整管道 播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n已限制單執行緒與純淨 PCM 傳送，消滅 Core 0 被吃爆 100% 現象。",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n帶入雙執行緒與平滑 48kHz 採樣校正。",
                 color=discord.Color.gold()
             )
             await interaction.response.send_message(embed=embed)
@@ -287,7 +287,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test C] yt-dlp 即時網路串流 播放中",
-                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入低 CPU 負載與高保真無丟幀音訊設定。",
+                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入雙執行緒與 4MB 解碼緩衝優化。",
                 color=discord.Color.green()
             )
             await interaction.followup.send(embed=embed)

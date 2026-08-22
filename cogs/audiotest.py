@@ -16,10 +16,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_tests")
 os.makedirs(TEST_AUDIO_DIR, exist_ok=True)
 
-# 開啟 2 個 Threads 提升複雜音訊解碼算力，擴大 probesize/analyzeduration 緩衝，加入高保真 48kHz 重採樣 (-af aresample=48000) 徹底平滑拍點
-HTTP_BEFORE_OPTIONS = "-threads 2 -probesize 4M -analyzeduration 4000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+# 網路與本機檔解碼參數：強制僅解碼音訊軌 (-map 0:a:0)，徹底忽略影音檔(Format 18 MP4)之視訊軌，避開 CPU 雙核跑滿與開頭卡頓
+HTTP_BEFORE_OPTIONS = "-threads 2 -probesize 1M -analyzeduration 2000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 LOCAL_BEFORE_OPTIONS = "-threads 2 -probesize 4M -analyzeduration 4000000"
-CLEAN_FFMPEG_OPTIONS = "-vn -af aresample=48000"
+CLEAN_FFMPEG_OPTIONS = "-map 0:a:0 -vn -af aresample=48000"
 
 
 def resolve_test_filepath(filename: str) -> Optional[str]:
@@ -124,7 +124,7 @@ class AudioTestCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ 執行 Test A 失敗: {e}")
 
-    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord (雙執行緒+4M緩衝)")
+    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_48k.wav)")
     async def test_b1(self, interaction: discord.Interaction, filename: str = "test_48k.wav"):
         vc = await self.ensure_voice(interaction)
@@ -153,15 +153,15 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B1] 本機 48kHz 直推播放中 (2 Threads + 4MB 緩衝)",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n開滿 2 執行緒與 4MB 快取緩衝，確保空白拍點與留白處不搶拍、不早進。",
+                title="▶️ [Test B1] 本機 48kHz 直推播放中",
+                description=f"檔案: `{os.path.basename(filepath)}`",
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B1 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord (雙執行緒+4M緩衝)")
+    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord (評分 99/100 參考)")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_441k.mp3)")
     async def test_b2(self, interaction: discord.Interaction, filename: str = "test_441k.mp3"):
         vc = await self.ensure_voice(interaction)
@@ -190,8 +190,8 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中 (2 Threads + 4MB 緩衝)",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n專為複雜配器與高資訊量樂曲優化，確保音效繁複處與空白卡點處拍點 100% 對齊。",
+                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample 播放中 (99分最佳標竿)",
+                description=f"檔案: `{os.path.basename(filepath)}`",
                 color=discord.Color.purple()
             )
             await interaction.response.send_message(embed=embed)
@@ -228,14 +228,14 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test B3] 本機 48kHz -> FFmpeg 完整管道 播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n帶入雙執行緒與平滑 48kHz 採樣校正。",
+                description=f"檔案: `{os.path.basename(filepath)}`",
                 color=discord.Color.gold()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B3 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_c", description="🧪 [Test C] 測試 yt-dlp 網路串流 -> FFmpeg -> Discord 完整管線")
+    @app_commands.command(name="test_c", description="🧪 [Test C] 測試 yt-dlp 網路串流 (強制 -map 0:a:0 拋棄視訊軌/優化網路緩衝)")
     @app_commands.describe(query="測試的 YouTube 影片關鍵字或網址")
     async def test_c(self, interaction: discord.Interaction, query: str = "NRQRC_0ZQ00"):
         vc = await self.ensure_voice(interaction)
@@ -248,7 +248,7 @@ class AudioTestCog(commands.Cog):
 
         def extract():
             opts = {
-                "format": "bestaudio/best",
+                "format": "ba/ba*/bestaudio/best",
                 "extract_flat": False,
                 "noplaylist": True,
                 "quiet": True,
@@ -277,6 +277,7 @@ class AudioTestCog(commands.Cog):
                 vc.stop()
                 await asyncio.sleep(0.1)
 
+            # 強制帶入 -map 0:a:0，忽略影音混合檔(Format 18 MP4)之視訊軌，避開 CPU 雙核吃爆與開頭卡頓
             source = discord.FFmpegPCMAudio(stream_url, before_options=HTTP_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
@@ -286,8 +287,8 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test C] yt-dlp 即時網路串流 播放中",
-                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入雙執行緒與 4MB 解碼緩衝優化。",
+                title="▶️ [Test C] yt-dlp 即時網路串流 播放中 (針對性 -map 0:a:0 拋棄視訊)",
+                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入 `-map 0:a:0` 徹底拋棄視訊軌解碼，防止雙核跑滿與開頭卡頓。",
                 color=discord.Color.green()
             )
             await interaction.followup.send(embed=embed)

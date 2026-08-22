@@ -82,10 +82,10 @@ if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
 
 
 
-# FFmpeg 串流優化設定：開啟 2 執行緒 (-threads 2) 與 4MB 緩衝 (-probesize 4M -analyzeduration 4000000)，加入 -af aresample=48000 確保音樂留白卡點與複雜樂段拍點 100% 精準不搶拍
-FFMPEG_OPTIONS_HTTP = "-threads 2 -probesize 4M -analyzeduration 4000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+# FFmpeg 串流優化設定：強制帶入 -map 0:a:0 -vn -af aresample=48000，拋棄影音檔(Format 18 MP4)之視訊軌解碼，避開 CPU 雙核跑滿與開頭卡頓
+FFMPEG_OPTIONS_HTTP = "-threads 2 -probesize 1M -analyzeduration 2000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS_LOCAL = "-threads 2 -probesize 4M -analyzeduration 4000000"
-FFMPEG_OPTIONS_CLEAN = "-vn -af aresample=48000"
+FFMPEG_OPTIONS_CLEAN = "-map 0:a:0 -vn -af aresample=48000"
 
 FFMPEG_OPTIONS = {
     "before_options": FFMPEG_OPTIONS_HTTP,

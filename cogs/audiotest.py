@@ -59,7 +59,7 @@ class AudioTestCog(commands.Cog):
 
         return vc
 
-    # ------------------ Slash Commands for A/B1/B2/B3/C ------------------
+    # ------------------ Slash Commands for A/B1/B2/B3/C1/C2 ------------------
 
     @app_commands.command(name="test_a", description="🧪 [Test A] 測試 FFmpeg 本機 44.1kHz -> 48kHz 轉碼效能 (無 Discord/無 yt-dlp)")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_441k.mp3)")
@@ -215,7 +215,7 @@ class AudioTestCog(commands.Cog):
 
         if vc.is_playing() or vc.is_paused():
             vc.stop()
-            await asyncio.sleep(0.1)
+            await asyncio.stop()
 
         try:
             source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
@@ -235,18 +235,105 @@ class AudioTestCog(commands.Cog):
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B3 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_c", description="🧪 [Test C] 測試 yt-dlp 網路串流 (強制 -map 0:a:0 拋棄視訊軌/優化網路緩衝)")
-    @app_commands.describe(query="測試的 YouTube 影片關鍵字或網址")
-    async def test_c(self, interaction: discord.Interaction, query: str = "NRQRC_0ZQ00"):
+    @app_commands.command(name="test_c1", description="🧪 [Test C1] 完整下載 YT 檔案至本機 ➔ 再用 FFmpeg 輸出至 Discord (全程日誌紀錄)")
+    @app_commands.describe(url="測試的 YouTube 影片網址或關鍵字")
+    async def test_c1(self, interaction: discord.Interaction, url: str):
         vc = await self.ensure_voice(interaction)
         if not vc:
             return
 
         await interaction.response.defer()
-
         loop = asyncio.get_running_loop()
 
-        def extract():
+        out_path = os.path.join(TEST_AUDIO_DIR, "c1_download.webm")
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        logger.info(f"========== [Test C1] 開始全流程測試 (目標網址: {url}) ==========")
+        logger.info(f"[Test C1 Step 1/2] 啟動 yt-dlp 下載至本機檔 `{out_path}`...")
+
+        t_dl_start = time.time()
+
+        def do_download():
+            opts = {
+                "format": "ba/ba*/bestaudio/best",
+                "outtmpl": out_path,
+                "quiet": True,
+                "overwrites": True,
+                "extractor_args": {"youtube": {"player_client": ["tv", "web_creator", "ios", "mweb", "android"]}}
+            }
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(url, download=True)
+                return info
+
+        try:
+            info = await loop.run_in_executor(None, do_download)
+            t_dl_end = time.time()
+            dl_ms = (t_dl_end - t_dl_start) * 1000
+
+            if not os.path.exists(out_path):
+                await interaction.followup.send("❌ [Test C1] 下載失敗：未產生實體檔案！")
+                return
+
+            file_size_bytes = os.path.getsize(out_path)
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            title = info.get("title", "未知曲名")
+            format_id = info.get("format_id", "N/A")
+            ext = info.get("ext", "N/A")
+            acodec = info.get("acodec", "N/A")
+
+            logger.info(f"[Test C1 Step 1/2 完成] 下載耗時: {dl_ms:.2f}ms, 大小: {file_size_mb:.2f}MB, Format: {format_id} ({ext}, codec: {acodec})")
+            logger.info(f"[Test C1 Step 2/2] 初始化 FFmpeg 讀取本機檔 `{out_path}` 並推送 Discord...")
+
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+                await asyncio.sleep(0.1)
+
+            source = discord.FFmpegPCMAudio(out_path, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
+
+            def after_play(err):
+                if err:
+                    logger.error(f"[Test C1] FFmpeg 播放例外: {err}")
+                else:
+                    logger.info("[Test C1] FFmpeg 播放成功結束。")
+
+            vc.play(source, after=after_play)
+
+            embed = discord.Embed(
+                title="▶️ [Test C1] 本機下載 ➔ FFmpeg 直推 播放中",
+                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n已記錄全流程 Log。此階段相當於完整隔離 yt-dlp 網路串流，比照 B2 模式播放。",
+                color=discord.Color.blue()
+            )
+            embed.add_field(name="1. 下載耗時", value=f"`{dl_ms:.2f} ms`", inline=True)
+            embed.add_field(name="2. 檔案大小", value=f"`{file_size_mb:.2f} MB`", inline=True)
+            embed.add_field(name="3. 格式資訊", value=f"`id: {format_id} ({ext}, codec: {acodec})`", inline=False)
+            embed.add_field(name="4. FFmpeg Before", value=f"`{LOCAL_BEFORE_OPTIONS}`", inline=False)
+            embed.add_field(name="5. FFmpeg Options", value=f"`{CLEAN_FFMPEG_OPTIONS}`", inline=False)
+
+            await interaction.followup.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[Test C1] 測試例外失敗: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ [Test C1] 執行失敗: {e}")
+
+    @app_commands.command(name="test_c2", description="🧪 [Test C2] 完整供應鏈即時網路串流 ➔ FFmpeg 直推 (全程日誌紀錄)")
+    @app_commands.describe(url="測試的 YouTube 影片網址或關鍵字")
+    async def test_c2(self, interaction: discord.Interaction, url: str):
+        vc = await self.ensure_voice(interaction)
+        if not vc:
+            return
+
+        await interaction.response.defer()
+        loop = asyncio.get_running_loop()
+
+        logger.info(f"========== [Test C2] 開始全流程即時串流測試 (目標網址: {url}) ==========")
+        logger.info("[Test C2 Step 1/2] 解析 YouTube 即時音訊 HTTP 網址...")
+
+        t_res_start = time.time()
+
+        def do_resolve():
             opts = {
                 "format": "ba/ba*/bestaudio/best",
                 "extract_flat": False,
@@ -255,46 +342,61 @@ class AudioTestCog(commands.Cog):
                 "extractor_args": {"youtube": {"player_client": ["tv", "web_creator", "ios", "mweb", "android"]}}
             }
             with yt_dlp.YoutubeDL(opts) as ytdl:
-                info = ytdl.extract_info(query, download=False)
-                if not info:
-                    return None
-                if "entries" in info:
-                    entries = [e for e in info["entries"] if e]
-                    if not entries: return None
-                    info = entries[0]
+                info = ytdl.extract_info(url, download=False)
                 return info
 
         try:
-            data = await loop.run_in_executor(None, extract)
-            if not data or not data.get("url"):
-                await interaction.followup.send("❌ Test C 解析 YouTube 音源網址失敗！")
+            info = await loop.run_in_executor(None, do_resolve)
+            t_res_end = time.time()
+            res_ms = (t_res_end - t_res_start) * 1000
+
+            if not info or not info.get("url"):
+                await interaction.followup.send("❌ [Test C2] 即時串流網址解析失敗！")
                 return
 
-            stream_url = data.get("url")
-            title = data.get("title", "未知曲名")
+            stream_url = info.get("url")
+            title = info.get("title", "未知曲名")
+            format_id = info.get("format_id", "N/A")
+            ext = info.get("ext", "N/A")
+            acodec = info.get("acodec", "N/A")
+            user_agent = info.get("http_headers", {}).get("User-Agent", "N/A")
 
-            user_agent = data.get("http_headers", {}).get("User-Agent")
             http_before = HTTP_BEFORE_OPTIONS
-            if user_agent:
+            if user_agent and user_agent != "N/A":
                 http_before = f"-headers \"User-Agent: {user_agent}\\r\\n\" {HTTP_BEFORE_OPTIONS}"
 
-            # 強制帶入 User-Agent 標頭與 -map 0:a:0，避免 YouTube 針對防盜鏈 HTTP 限速與丟套封包
+            logger.info(f"[Test C2 Step 1/2 完成] 解析耗時: {res_ms:.2f}ms, Format: {format_id} ({ext}, codec: {acodec})")
+            logger.info(f"[Test C2 Step 2/2] 初始化 FFmpeg 讀取 HTTP 串流 `{stream_url[:60]}...` 並推送 Discord...")
+
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+                await asyncio.sleep(0.1)
+
             source = discord.FFmpegPCMAudio(stream_url, before_options=http_before, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
-                    logger.error(f"[Test C] 播放例外: {err}")
+                    logger.error(f"[Test C2] FFmpeg 串流播放例外: {err}")
+                else:
+                    logger.info("[Test C2] FFmpeg 串流播放成功結束。")
 
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test C] yt-dlp 即時網路串流 播放中 (針對性 -map 0:a:0 拋棄視訊)",
-                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入 `-map 0:a:0` 徹底拋棄視訊軌解碼，防止雙核跑滿與開頭卡頓。",
+                title="▶️ [Test C2] 完整供應鏈即時網路串流 播放中",
+                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n已記錄全流程 Log。用於與 Test C1 進行 Diff 對比解析。",
                 color=discord.Color.green()
             )
+            embed.add_field(name="1. 解析耗時", value=f"`{res_ms:.2f} ms`", inline=True)
+            embed.add_field(name="2. 格式資訊", value=f"`id: {format_id} ({ext}, codec: {acodec})`", inline=False)
+            embed.add_field(name="3. User-Agent", value=f"`{user_agent[:40]}...`", inline=False)
+            embed.add_field(name="4. FFmpeg Before", value=f"`{http_before}`", inline=False)
+            embed.add_field(name="5. FFmpeg Options", value=f"`{CLEAN_FFMPEG_OPTIONS}`", inline=False)
+
             await interaction.followup.send(embed=embed)
         except Exception as e:
-            await interaction.followup.send(f"❌ 啟動 Test C 失敗: {e}")
+            logger.error(f"[Test C2] 測試例外失敗: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ [Test C2] 執行失敗: {e}")
 
 
 async def setup(bot: commands.Bot):

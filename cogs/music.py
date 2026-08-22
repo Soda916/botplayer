@@ -425,6 +425,23 @@ class MusicCog(commands.Cog):
             else:
                 self.start_idle_timer(player)
 
+    async def create_audio_source(self, stream_url: str, offset_seconds: int = 0) -> discord.AudioSource:
+        """創設音訊源：優先使用 FFmpegOpusAudio (C 原生 Opus 轉碼)，徹底消除 CPU 時脈漂移導致之時快時慢問題"""
+        ffmpeg_before = get_ffmpeg_before_options(stream_url, offset_seconds)
+        try:
+            return await discord.FFmpegOpusAudio.from_probe(
+                stream_url,
+                before_options=ffmpeg_before,
+                options=FFMPEG_OPTIONS_CLEAN,
+            )
+        except Exception as e:
+            logger.warning(f"FFmpegOpusAudio 原生創設失敗，降級使用 FFmpegPCMAudio: {e}")
+            return discord.FFmpegPCMAudio(
+                stream_url,
+                before_options=ffmpeg_before,
+                options=FFMPEG_OPTIONS_CLEAN,
+            )
+
     def play_track_with_offset(self, guild_id: int, track: Track, offset_seconds: int = 0, paused: bool = False):
         """從指定秒數斷點接續播放歌曲"""
         player = self.get_player(guild_id)
@@ -435,39 +452,37 @@ class MusicCog(commands.Cog):
         self.cancel_idle_timer(player)
         player.current_track = track
 
-        ffmpeg_before = get_ffmpeg_before_options(track.stream_url, offset_seconds)
+        async def start_play():
+            for _ in range(20):
+                if not (vc.is_playing() or vc.is_paused()):
+                    break
+                vc.stop()
+                await asyncio.sleep(0.05)
 
-        # 如果前一首還在播放或停止中，等待舊音訊流釋放完畢
-        for _ in range(20):
-            if not (vc.is_playing() or vc.is_paused()):
-                break
-            vc.stop()
-            time.sleep(0.05)
+            try:
+                source = await self.create_audio_source(track.stream_url, offset_seconds)
 
-        try:
-            source = discord.FFmpegPCMAudio(
-                track.stream_url,
-                before_options=ffmpeg_before,
-                options=FFMPEG_OPTIONS_CLEAN,
-            )
+                def after_playing(error):
+                    if error:
+                        logger.error(f"FFmpeg 播放例外: {error}")
+                    self.play_next_track(guild_id)
 
-            def after_playing(error):
-                if error:
-                    logger.error(f"FFmpeg 播放例外: {error}")
+                player.on_track_start()
+                if offset_seconds > 0:
+                    player.track_start_time = time.time() - offset_seconds
+
+                vc.play(source, after=after_playing)
+                if paused:
+                    vc.pause()
+                    player.on_pause()
+                await self.update_panel(guild_id)
+            except Exception as e:
+                logger.error(f"斷點播放音訊失敗 [{track.title}]: {e}")
                 self.play_next_track(guild_id)
 
-            player.on_track_start()
-            if offset_seconds > 0:
-                player.track_start_time = time.time() - offset_seconds
+        loop = asyncio.get_running_loop()
+        loop.create_task(start_play())
 
-            vc.play(source, after=after_playing)
-            if paused:
-                vc.pause()
-                player.on_pause()
-            asyncio.run_coroutine_threadsafe(self.update_panel(guild_id), self.bot.loop)
-        except Exception as e:
-            logger.error(f"斷點播放音訊失敗 [{track.title}]: {e}")
-            self.play_next_track(guild_id)
 
     def get_player(self, guild_id: int) -> GuildPlayer:
         if guild_id not in self.players:
@@ -814,12 +829,7 @@ class MusicCog(commands.Cog):
                         except Exception:
                             pass
 
-                    ffmpeg_before = get_ffmpeg_before_options(resolved_track.stream_url)
-                    source = discord.FFmpegPCMAudio(
-                        resolved_track.stream_url,
-                        before_options=ffmpeg_before,
-                        options=FFMPEG_OPTIONS_CLEAN,
-                    )
+                    source = await self.create_audio_source(resolved_track.stream_url)
 
                     def after_playing(error):
                         if error:

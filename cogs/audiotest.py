@@ -59,7 +59,16 @@ class AudioTestCog(commands.Cog):
 
         return vc
 
-    # ------------------ Slash Commands for A/B1/B2/B3/C1/C2 ------------------
+    async def cleanup_voice_player(self, vc: discord.VoiceClient):
+        """徹底清理語音播放器，確保舊 FFmpeg 行程完全釋放死透，避免殘留進程污染 CPU 或發送"""
+        if vc.is_playing() or vc.is_paused():
+            vc.stop()
+            for _ in range(20):
+                if not (vc.is_playing() or vc.is_paused()):
+                    break
+                await asyncio.sleep(0.1)
+
+    # ------------------ Slash Commands for A/B1/B2/B3/C1/C2/C3 ------------------
 
     @app_commands.command(name="test_a", description="🧪 [Test A] 測試 FFmpeg 本機 44.1kHz -> 48kHz 轉碼效能 (無 Discord/無 yt-dlp)")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_441k.mp3)")
@@ -139,9 +148,7 @@ class AudioTestCog(commands.Cog):
             )
             return
 
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-            await asyncio.sleep(0.1)
+        await self.cleanup_voice_player(vc)
 
         try:
             source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
@@ -176,9 +183,7 @@ class AudioTestCog(commands.Cog):
             )
             return
 
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-            await asyncio.sleep(0.1)
+        await self.cleanup_voice_player(vc)
 
         try:
             source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
@@ -213,9 +218,7 @@ class AudioTestCog(commands.Cog):
             )
             return
 
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-            await asyncio.sleep(0.1)
+        await self.cleanup_voice_player(vc)
 
         try:
             source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
@@ -288,9 +291,7 @@ class AudioTestCog(commands.Cog):
             logger.info(f"[Test C1 Step 1/2 完成] 下載耗時: {dl_ms:.2f}ms, 大小: {file_size_mb:.2f}MB, Format: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})")
             logger.info(f"[Test C1 Step 2/2] 初始化 FFmpeg 讀取本機檔 `{out_path}` 並推送 Discord...")
 
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-                await asyncio.sleep(0.1)
+            await self.cleanup_voice_player(vc)
 
             source = discord.FFmpegPCMAudio(out_path, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
@@ -368,9 +369,7 @@ class AudioTestCog(commands.Cog):
             logger.info(f"[Test C2 Step 1/2 完成] 解析耗時: {res_ms:.2f}ms, Format: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})")
             logger.info(f"[Test C2 Step 2/2] 初始化 FFmpeg 讀取純音訊 Format {format_id} 串流 `{stream_url[:60]}...` 並推送 Discord...")
 
-            if vc.is_playing() or vc.is_paused():
-                vc.stop()
-                await asyncio.sleep(0.1)
+            await self.cleanup_voice_player(vc)
 
             source = discord.FFmpegPCMAudio(stream_url, before_options=http_before, options=CLEAN_FFMPEG_OPTIONS)
 
@@ -397,6 +396,153 @@ class AudioTestCog(commands.Cog):
         except Exception as e:
             logger.error(f"[Test C2] 測試例外失敗: {e}", exc_info=True)
             await interaction.followup.send(f"❌ [Test C2] 執行失敗: {e}")
+
+    @app_commands.command(name="test_c3", description="🧪 [Test C3] 一鍵自動連續執行 C1 ➔ 等待 5 秒主動通知 ➔ 自動啟動 C2")
+    @app_commands.describe(url="測試的 YouTube 影片網址或關鍵字")
+    async def test_c3(self, interaction: discord.Interaction, url: str):
+        vc = await self.ensure_voice(interaction)
+        if not vc:
+            return
+
+        await interaction.response.defer()
+        loop = asyncio.get_running_loop()
+
+        channel = interaction.channel
+
+        logger.info(f"==================== [Test C3 一鍵雙測] 開始 (目標網址: {url}) ====================")
+        logger.info("[Test C3 階段 1/2] 啟動 C1 測試 (下載至本機檔 ➔ FFmpeg 直推)...")
+
+        out_path = os.path.join(TEST_AUDIO_DIR, "c3_download.webm")
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        t_dl_start = time.time()
+
+        def do_download():
+            opts = {
+                "format": "bestaudio/best",
+                "outtmpl": out_path,
+                "quiet": True,
+                "overwrites": True
+            }
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(url, download=True)
+                return info
+
+        try:
+            info = await loop.run_in_executor(None, do_download)
+            t_dl_end = time.time()
+            dl_ms = (t_dl_end - t_dl_start) * 1000
+
+            file_size_bytes = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+            file_size_mb = file_size_bytes / (1024 * 1024)
+            title = info.get("title", "未知曲名")
+            format_id = info.get("format_id", "N/A")
+            ext = info.get("ext", "N/A")
+            acodec = info.get("acodec", "N/A")
+            vcodec = info.get("vcodec", "none")
+
+            await self.cleanup_voice_player(vc)
+
+            c1_finished_event = asyncio.Event()
+
+            source1 = discord.FFmpegPCMAudio(out_path, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
+
+            def after_c1(err):
+                if err:
+                    logger.error(f"[Test C3-C1] 播放例外: {err}")
+                else:
+                    logger.info("[Test C3-C1] 階段 1 本機播放完成。")
+                loop.call_soon_threadsafe(c1_finished_event.set)
+
+            vc.play(source1, after=after_c1)
+
+            embed1 = discord.Embed(
+                title="▶️ [Test C3 階段 1/2] C1 本機下載檔 播放中",
+                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n一鍵兩測階段 1。播畢後將自動發送 5 秒冷卻通知並開啟 C2 串流測試。",
+                color=discord.Color.blue()
+            )
+            embed1.add_field(name="下載耗時", value=f"`{dl_ms:.2f} ms`", inline=True)
+            embed1.add_field(name="檔案大小", value=f"`{file_size_mb:.2f} MB`", inline=True)
+            embed1.add_field(name="格式 ID", value=f"`{format_id} ({ext})`", inline=True)
+
+            await interaction.followup.send(embed=embed1)
+
+            # 等待 C1 播放完成
+            logger.info("[Test C3] 等待 C1 本機播放完成...")
+            await c1_finished_event.wait()
+
+            # C1 完成，發送頻道通知並等待 5 秒
+            logger.info("[Test C3] C1 播放完成！發送頻道通知並冷卻 5 秒...")
+            if channel:
+                await channel.send("📢 **[Test C3 自動化測試通知]** C1 測試（下載後直推）已完成！將在 **5 秒** 後自動發動 C2 測試（即時網路串流）...")
+
+            for i in range(5, 0, -1):
+                await asyncio.sleep(1.0)
+
+            # 階段 2: 啟動 C2 即時串流測試
+            logger.info("[Test C3 階段 2/2] 啟動 C2 測試 (即時網路串流 ➔ FFmpeg 直推)...")
+            await self.cleanup_voice_player(vc)
+
+            t_res_start = time.time()
+
+            def do_resolve():
+                opts = {
+                    "format": "bestaudio/best",
+                    "extract_flat": False,
+                    "noplaylist": True,
+                    "quiet": True,
+                }
+                with yt_dlp.YoutubeDL(opts) as ytdl:
+                    res_info = ytdl.extract_info(url, download=False)
+                    return res_info
+
+            c2_info = await loop.run_in_executor(None, do_resolve)
+            t_res_end = time.time()
+            res_ms = (t_res_end - t_res_start) * 1000
+
+            stream_url = c2_info.get("url")
+            c2_format_id = c2_info.get("format_id", "N/A")
+            c2_ext = c2_info.get("ext", "N/A")
+            c2_acodec = c2_info.get("acodec", "N/A")
+            c2_vcodec = c2_info.get("vcodec", "none")
+            user_agent = c2_info.get("http_headers", {}).get("User-Agent", "")
+
+            http_before = HTTP_BEFORE_OPTIONS
+            if user_agent:
+                http_before = f"-headers \"User-Agent: {user_agent}\r\n\" {HTTP_BEFORE_OPTIONS}"
+
+            source2 = discord.FFmpegPCMAudio(stream_url, before_options=http_before, options=CLEAN_FFMPEG_OPTIONS)
+
+            def after_c2(err):
+                if err:
+                    logger.error(f"[Test C3-C2] 串流播放例外: {err}")
+                else:
+                    logger.info("[Test C3-C2] 階段 2 串流播放完成。")
+
+            vc.play(source2, after=after_c2)
+
+            embed2 = discord.Embed(
+                title="▶️ [Test C3 階段 2/2] C2 即時網路串流 播放中",
+                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n一鍵兩測階段 2。請對比 C1 (階段1) 與 C2 (階段2) 之聽感差異！",
+                color=discord.Color.green()
+            )
+            embed2.add_field(name="解析耗時", value=f"`{res_ms:.2f} ms`", inline=True)
+            embed2.add_field(name="格式 ID", value=f"`{c2_format_id} ({c2_ext})`", inline=True)
+            embed2.add_field(name="User-Agent", value=f"`{user_agent[:40]}...`", inline=False)
+
+            if channel:
+                await channel.send(embed=embed2)
+
+            logger.info("==================== [Test C3 一鍵雙測] 全流程成功發動 ====================")
+
+        except Exception as e:
+            logger.error(f"[Test C3] 一鍵測試例外失敗: {e}", exc_info=True)
+            if channel:
+                await channel.send(f"❌ [Test C3] 一鍵測試失敗: {e}")
 
 
 async def setup(bot: commands.Bot):

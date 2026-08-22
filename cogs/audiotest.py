@@ -16,9 +16,10 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_tests")
 os.makedirs(TEST_AUDIO_DIR, exist_ok=True)
 
-# 網路 HTTP 串流前置選項 (僅適用於 http/https 網址)
-HTTP_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-CLEAN_FFMPEG_OPTIONS = "-vn -af aresample=48000:async=1"
+# 限制 FFmpeg 單執行緒 (-threads 1)，防止 e2-micro Core 0 吃爆與 cgroup 降頻；完全移除會砍掉人聲特徵的 async=1 濾鏡
+HTTP_BEFORE_OPTIONS = "-threads 1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+LOCAL_BEFORE_OPTIONS = "-threads 1"
+CLEAN_FFMPEG_OPTIONS = "-vn"
 
 
 def resolve_test_filepath(filename: str) -> Optional[str]:
@@ -80,8 +81,8 @@ class AudioTestCog(commands.Cog):
                 pass
 
         cmd = [
-            "ffmpeg", "-y", "-i", filepath,
-            "-ar", "48000", "-ac", "2", "-af", "aresample=48000:async=1",
+            "ffmpeg", "-threads", "1", "-y", "-i", filepath,
+            "-ar", "48000", "-ac", "2",
             out_path
         ]
 
@@ -123,7 +124,7 @@ class AudioTestCog(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"❌ 執行 Test A 失敗: {e}")
 
-    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord (FFmpeg C-Opus 直解)")
+    @app_commands.command(name="test_b1", description="🧪 [Test B1] 測試本機原生 48kHz 音訊直推 Discord")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_48k.wav)")
     async def test_b1(self, interaction: discord.Interaction, filename: str = "test_48k.wav"):
         vc = await self.ensure_voice(interaction)
@@ -143,8 +144,7 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            # 改用 FFmpegOpusAudio：由 FFmpeg 原生完成 C-Opus 編碼，降低 70% CPU 負荷，徹底根治音速漂移/時快時慢！
-            source = await discord.FFmpegOpusAudio.from_probe(filepath, options=CLEAN_FFMPEG_OPTIONS)
+            source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -153,15 +153,15 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B1] 本機 48kHz 直推播放中 (FFmpeg C-Opus 引擎)",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n採用 C 語言原生 Opus 編碼傳輸，消除 Python 主執行緒連線時快時慢。 ",
+                title="▶️ [Test B1] 本機 48kHz 直推播放中",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n已限制 `-threads 1` 防止 CPU 吃爆，並移除丟幀的 `async=1` 濾鏡。",
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B1 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord (FFmpeg C-Opus 直解)")
+    @app_commands.command(name="test_b2", description="🧪 [Test B2] 測試本機 44.1kHz -> FFmpeg Resample 48kHz -> Discord")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_441k.mp3)")
     async def test_b2(self, interaction: discord.Interaction, filename: str = "test_441k.mp3"):
         vc = await self.ensure_voice(interaction)
@@ -181,8 +181,7 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            # 改用 FFmpegOpusAudio：由 FFmpeg 原生完成 44.1k->48k 重採樣與 C-Opus 編碼，根治音速漂移/時快時慢！
-            source = await discord.FFmpegOpusAudio.from_probe(filepath, options=CLEAN_FFMPEG_OPTIONS)
+            source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -191,15 +190,15 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中 (FFmpeg C-Opus 引擎)",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n由 FFmpeg C 語言底層一次完成 44.1k 重採樣與 Opus 編碼，徹底排除 Python CPU 瓶頸造成的音速飄移。",
+                title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n採用高保真連續 PCM 傳送，杜絕人聲被切斷與音樂卡頓問題。",
                 color=discord.Color.purple()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B2 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_b3", description="🧪 [Test B3] 測試本機 48kHz -> FFmpeg 完整管道 -> Discord (FFmpeg C-Opus 直解)")
+    @app_commands.command(name="test_b3", description="🧪 [Test B3] 測試本機 48kHz -> FFmpeg 完整管道 -> Discord")
     @app_commands.describe(filename="測試檔案名稱 (預設: test_48k.wav)")
     async def test_b3(self, interaction: discord.Interaction, filename: str = "test_48k.wav"):
         vc = await self.ensure_voice(interaction)
@@ -219,8 +218,7 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            # 改用 FFmpegOpusAudio：由 FFmpeg 原生完成 C-Opus 編碼
-            source = await discord.FFmpegOpusAudio.from_probe(filepath, options=CLEAN_FFMPEG_OPTIONS)
+            source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -229,15 +227,15 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test B3] 本機 48kHz -> FFmpeg 完整管道 播放中 (FFmpeg C-Opus 引擎)",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n驗證 48kHz 原生音訊經由 FFmpeg C 原生 Opus 管道傳播之穩定度。",
+                title="▶️ [Test B3] 本機 48kHz -> FFmpeg 完整管道 播放中",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n已限制單執行緒與純淨 PCM 傳送，消滅 Core 0 被吃爆 100% 現象。",
                 color=discord.Color.gold()
             )
             await interaction.response.send_message(embed=embed)
         except Exception as e:
             await interaction.response.send_message(f"❌ 啟動 Test B3 失敗: {e}", ephemeral=True)
 
-    @app_commands.command(name="test_c", description="🧪 [Test C] 測試 yt-dlp 網路串流 -> FFmpeg C-Opus -> Discord 完整管線")
+    @app_commands.command(name="test_c", description="🧪 [Test C] 測試 yt-dlp 網路串流 -> FFmpeg -> Discord 完整管線")
     @app_commands.describe(query="測試的 YouTube 影片關鍵字或網址")
     async def test_c(self, interaction: discord.Interaction, query: str = "NRQRC_0ZQ00"):
         vc = await self.ensure_voice(interaction)
@@ -279,11 +277,7 @@ class AudioTestCog(commands.Cog):
                 vc.stop()
                 await asyncio.sleep(0.1)
 
-            source = await discord.FFmpegOpusAudio.from_probe(
-                stream_url,
-                before_options=HTTP_BEFORE_OPTIONS,
-                options=CLEAN_FFMPEG_OPTIONS
-            )
+            source = discord.FFmpegPCMAudio(stream_url, before_options=HTTP_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -292,8 +286,8 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test C] yt-dlp 即時網路串流 播放中 (FFmpeg C-Opus 引擎)",
-                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n結合 yt-dlp 串流解析與 FFmpeg 原生 C-Opus 串流，實現零時序漂移播放。",
+                title="▶️ [Test C] yt-dlp 即時網路串流 播放中",
+                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入低 CPU 負載與高保真無丟幀音訊設定。",
                 color=discord.Color.green()
             )
             await interaction.followup.send(embed=embed)

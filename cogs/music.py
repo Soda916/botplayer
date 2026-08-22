@@ -82,10 +82,10 @@ if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
 
 
 
-# FFmpeg 串流優化設定：區分網路與本機檔選項，動態避開 Option reconnect not found 錯誤，並清空重複 -ar/-ac 參數
-FFMPEG_OPTIONS_HTTP = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 1M -analyzeduration 2000000"
-FFMPEG_OPTIONS_LOCAL = "-probesize 1M -analyzeduration 2000000"
-FFMPEG_OPTIONS_CLEAN = "-vn -af aresample=48000:async=1"
+# FFmpeg 串流優化設定：限制 -threads 1 防止 CPU 吃爆，完全移除會硬砍人聲的 async=1 濾鏡，保留高保真 PCM 傳輸
+FFMPEG_OPTIONS_HTTP = "-threads 1 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 1M -analyzeduration 2000000"
+FFMPEG_OPTIONS_LOCAL = "-threads 1 -probesize 1M -analyzeduration 2000000"
+FFMPEG_OPTIONS_CLEAN = "-vn"
 
 FFMPEG_OPTIONS = {
     "before_options": FFMPEG_OPTIONS_HTTP,

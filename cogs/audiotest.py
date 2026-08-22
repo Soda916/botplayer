@@ -16,7 +16,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_tests")
 os.makedirs(TEST_AUDIO_DIR, exist_ok=True)
 
-# 網路與本機檔解碼參數：強制僅解碼音訊軌 (-map 0:a:0)，徹底忽略影音檔(Format 18 MP4)之視訊軌，避開 CPU 雙核跑滿與開頭卡頓
+# 網路與本機檔解碼參數：強制僅解碼音訊軌 (-map 0:a:0)，預設優先請求 Format 251 (純 48kHz WebM Opus 音訊)
 HTTP_BEFORE_OPTIONS = "-threads 2 -probesize 1M -analyzeduration 2000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 LOCAL_BEFORE_OPTIONS = "-threads 2 -probesize 4M -analyzeduration 4000000"
 CLEAN_FFMPEG_OPTIONS = "-map 0:a:0 -vn -af aresample=48000"
@@ -215,7 +215,7 @@ class AudioTestCog(commands.Cog):
 
         if vc.is_playing() or vc.is_paused():
             vc.stop()
-            await asyncio.stop()
+            await asyncio.sleep(0.1)
 
         try:
             source = discord.FFmpegPCMAudio(filepath, before_options=LOCAL_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
@@ -259,11 +259,10 @@ class AudioTestCog(commands.Cog):
 
         def do_download():
             opts = {
-                "format": "ba/ba*/bestaudio/best",
+                "format": "bestaudio/best",
                 "outtmpl": out_path,
                 "quiet": True,
-                "overwrites": True,
-                "extractor_args": {"youtube": {"player_client": ["tv", "web_creator", "ios", "mweb", "android"]}}
+                "overwrites": True
             }
             with yt_dlp.YoutubeDL(opts) as ytdl:
                 info = ytdl.extract_info(url, download=True)
@@ -284,8 +283,9 @@ class AudioTestCog(commands.Cog):
             format_id = info.get("format_id", "N/A")
             ext = info.get("ext", "N/A")
             acodec = info.get("acodec", "N/A")
+            vcodec = info.get("vcodec", "none")
 
-            logger.info(f"[Test C1 Step 1/2 完成] 下載耗時: {dl_ms:.2f}ms, 大小: {file_size_mb:.2f}MB, Format: {format_id} ({ext}, codec: {acodec})")
+            logger.info(f"[Test C1 Step 1/2 完成] 下載耗時: {dl_ms:.2f}ms, 大小: {file_size_mb:.2f}MB, Format: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})")
             logger.info(f"[Test C1 Step 2/2] 初始化 FFmpeg 讀取本機檔 `{out_path}` 並推送 Discord...")
 
             if vc.is_playing() or vc.is_paused():
@@ -309,7 +309,7 @@ class AudioTestCog(commands.Cog):
             )
             embed.add_field(name="1. 下載耗時", value=f"`{dl_ms:.2f} ms`", inline=True)
             embed.add_field(name="2. 檔案大小", value=f"`{file_size_mb:.2f} MB`", inline=True)
-            embed.add_field(name="3. 格式資訊", value=f"`id: {format_id} ({ext}, codec: {acodec})`", inline=False)
+            embed.add_field(name="3. 格式資訊", value=f"`id: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})`", inline=False)
             embed.add_field(name="4. FFmpeg Before", value=f"`{LOCAL_BEFORE_OPTIONS}`", inline=False)
             embed.add_field(name="5. FFmpeg Options", value=f"`{CLEAN_FFMPEG_OPTIONS}`", inline=False)
 
@@ -318,7 +318,7 @@ class AudioTestCog(commands.Cog):
             logger.error(f"[Test C1] 測試例外失敗: {e}", exc_info=True)
             await interaction.followup.send(f"❌ [Test C1] 執行失敗: {e}")
 
-    @app_commands.command(name="test_c2", description="🧪 [Test C2] 完整供應鏈即時網路串流 ➔ FFmpeg 直推 (全程日誌紀錄)")
+    @app_commands.command(name="test_c2", description="🧪 [Test C2] 完整供應鏈即時網路串流 ➔ FFmpeg 直推 (純 48k WebM Opus 優先)")
     @app_commands.describe(url="測試的 YouTube 影片網址或關鍵字")
     async def test_c2(self, interaction: discord.Interaction, url: str):
         vc = await self.ensure_voice(interaction)
@@ -329,17 +329,16 @@ class AudioTestCog(commands.Cog):
         loop = asyncio.get_running_loop()
 
         logger.info(f"========== [Test C2] 開始全流程即時串流測試 (目標網址: {url}) ==========")
-        logger.info("[Test C2 Step 1/2] 解析 YouTube 即時音訊 HTTP 網址...")
+        logger.info("[Test C2 Step 1/2] 解析 YouTube 純音訊 Format 251 HTTP 網址...")
 
         t_res_start = time.time()
 
         def do_resolve():
             opts = {
-                "format": "ba/ba*/bestaudio/best",
+                "format": "bestaudio/best",
                 "extract_flat": False,
                 "noplaylist": True,
                 "quiet": True,
-                "extractor_args": {"youtube": {"player_client": ["tv", "web_creator", "ios", "mweb", "android"]}}
             }
             with yt_dlp.YoutubeDL(opts) as ytdl:
                 info = ytdl.extract_info(url, download=False)
@@ -359,14 +358,15 @@ class AudioTestCog(commands.Cog):
             format_id = info.get("format_id", "N/A")
             ext = info.get("ext", "N/A")
             acodec = info.get("acodec", "N/A")
-            user_agent = info.get("http_headers", {}).get("User-Agent", "N/A")
+            vcodec = info.get("vcodec", "none")
+            user_agent = info.get("http_headers", {}).get("User-Agent", "")
 
             http_before = HTTP_BEFORE_OPTIONS
-            if user_agent and user_agent != "N/A":
-                http_before = f"-headers \"User-Agent: {user_agent}\\r\\n\" {HTTP_BEFORE_OPTIONS}"
+            if user_agent:
+                http_before = f"-headers \"User-Agent: {user_agent}\r\n\" {HTTP_BEFORE_OPTIONS}"
 
-            logger.info(f"[Test C2 Step 1/2 完成] 解析耗時: {res_ms:.2f}ms, Format: {format_id} ({ext}, codec: {acodec})")
-            logger.info(f"[Test C2 Step 2/2] 初始化 FFmpeg 讀取 HTTP 串流 `{stream_url[:60]}...` 並推送 Discord...")
+            logger.info(f"[Test C2 Step 1/2 完成] 解析耗時: {res_ms:.2f}ms, Format: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})")
+            logger.info(f"[Test C2 Step 2/2] 初始化 FFmpeg 讀取純音訊 Format {format_id} 串流 `{stream_url[:60]}...` 並推送 Discord...")
 
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
@@ -383,12 +383,12 @@ class AudioTestCog(commands.Cog):
             vc.play(source, after=after_play)
 
             embed = discord.Embed(
-                title="▶️ [Test C2] 完整供應鏈即時網路串流 播放中",
-                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n已記錄全流程 Log。用於與 Test C1 進行 Diff 對比解析。",
+                title="▶️ [Test C2] 完整供應鏈即時網路串流 播放中 (Format 251 純音訊與正確 CRLF 請求頭)",
+                description=f"歌曲: **[{title}]({info.get('webpage_url', url)})**\n\n已鎖定 Format 251 純 WebM Opus 音訊（無視訊軌干擾）與標準 CRLF User-Agent 標頭。",
                 color=discord.Color.green()
             )
             embed.add_field(name="1. 解析耗時", value=f"`{res_ms:.2f} ms`", inline=True)
-            embed.add_field(name="2. 格式資訊", value=f"`id: {format_id} ({ext}, codec: {acodec})`", inline=False)
+            embed.add_field(name="2. 格式資訊", value=f"`id: {format_id} ({ext}, acodec: {acodec}, vcodec: {vcodec})`", inline=False)
             embed.add_field(name="3. User-Agent", value=f"`{user_agent[:40]}...`", inline=False)
             embed.add_field(name="4. FFmpeg Before", value=f"`{http_before}`", inline=False)
             embed.add_field(name="5. FFmpeg Options", value=f"`{CLEAN_FFMPEG_OPTIONS}`", inline=False)

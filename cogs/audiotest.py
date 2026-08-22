@@ -11,15 +11,15 @@ import yt_dlp
 
 logger = logging.getLogger("botplayer.audiotest")
 
-# 解析專案根目錄絕路徑
+# 解析專案根目錄絕對路徑
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TEST_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_tests")
 os.makedirs(TEST_AUDIO_DIR, exist_ok=True)
 
-FFMPEG_OPTIONS_BASE = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn -f s16le -ar 48000 -ac 2 -af aresample=48000:async=1",
-}
+# 網路 HTTP 串流前置選項 (僅適用於 http/https 網址)
+HTTP_BEFORE_OPTIONS = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
+# 乾淨 FFmpegPCM 參數 (避免與 discord.py 預設的 -f s16le -ar 48000 -ac 2 重複)
+CLEAN_FFMPEG_OPTIONS = "-vn -af aresample=48000:async=1"
 
 
 def resolve_test_filepath(filename: str) -> Optional[str]:
@@ -144,7 +144,8 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            source = discord.FFmpegPCMAudio(filepath, options="-vn -f s16le -ar 48000 -ac 2")
+            # 本機檔案絕對不能傳入 -reconnect 1 !
+            source = discord.FFmpegPCMAudio(filepath, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -154,7 +155,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test B1] 本機 48kHz 直推播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n此測試用來隔離 Discord Voice 管線，完全繞過 44.1k 重採樣與 yt-dlp 網路串流。",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n已移除本機檔不相容之 `-reconnect` 參數與重複 `-ar/-ac` 標籤。",
                 color=discord.Color.blue()
             )
             await interaction.response.send_message(embed=embed)
@@ -181,7 +182,8 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            source = discord.FFmpegPCMAudio(filepath, options=FFMPEG_OPTIONS_BASE["options"])
+            # 本機檔案絕對不能傳入 -reconnect 1 !
+            source = discord.FFmpegPCMAudio(filepath, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -191,7 +193,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test B2] 本機 44.1kHz -> FFmpeg Resample -> Discord 播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n此測試專門驗證 FFmpeg 44.1k 到 48k 重採樣在 Discord 管道中是否會造成破音/卡頓/速度異常。",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n專門驗證本機 44.1k 音訊轉碼 48k 餵給 Discord Voice 之穩定度。",
                 color=discord.Color.purple()
             )
             await interaction.response.send_message(embed=embed)
@@ -218,7 +220,8 @@ class AudioTestCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         try:
-            source = discord.FFmpegPCMAudio(filepath, before_options=FFMPEG_OPTIONS_BASE["before_options"], options=FFMPEG_OPTIONS_BASE["options"])
+            # 本機檔案絕對不能傳入 -reconnect 1 !
+            source = discord.FFmpegPCMAudio(filepath, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -228,7 +231,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test B3] 本機 48kHz -> FFmpeg 完整管道 播放中",
-                description=f"檔案: `{os.path.basename(filepath)}`\n\n此測試驗證原本就是 48kHz 的音訊流經完整 FFmpeg Pipe 餵給 Discord 的穩定度。",
+                description=f"檔案: `{os.path.basename(filepath)}`\n\n驗證 48kHz 原生音訊經由完整 FFmpeg 管道餵給 Discord 之穩定度。",
                 color=discord.Color.gold()
             )
             await interaction.response.send_message(embed=embed)
@@ -252,7 +255,8 @@ class AudioTestCog(commands.Cog):
                 "extract_flat": False,
                 "noplaylist": True,
                 "quiet": True,
-                "extractor_args": {"youtube": {"player_client": ["mweb", "web_creator", "tv", "ios", "android"]}}
+                # 優先使用 tv, web_creator 避開 PO Token 與 JS Challenge
+                "extractor_args": {"youtube": {"player_client": ["tv", "web_creator", "ios", "mweb", "android"]}}
             }
             with yt_dlp.YoutubeDL(opts) as ytdl:
                 info = ytdl.extract_info(query, download=False)
@@ -277,7 +281,8 @@ class AudioTestCog(commands.Cog):
                 vc.stop()
                 await asyncio.sleep(0.1)
 
-            source = discord.FFmpegPCMAudio(stream_url, before_options=FFMPEG_OPTIONS_BASE["before_options"], options=FFMPEG_OPTIONS_BASE["options"])
+            # 網路 HTTP 串流才傳入 HTTP_BEFORE_OPTIONS (-reconnect 1)
+            source = discord.FFmpegPCMAudio(stream_url, before_options=HTTP_BEFORE_OPTIONS, options=CLEAN_FFMPEG_OPTIONS)
 
             def after_play(err):
                 if err:
@@ -287,7 +292,7 @@ class AudioTestCog(commands.Cog):
 
             embed = discord.Embed(
                 title="▶️ [Test C] yt-dlp 即時網路串流 播放中",
-                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n此測試包含完整的 yt-dlp 網路請求、FFmpeg 解碼與 Discord 串流傳輸。",
+                description=f"歌曲: **[{title}]({data.get('webpage_url', query)})**\n\n已帶入優化之 `tv`/`web_creator` Client 序列與網路 reconnect 參數。",
                 color=discord.Color.green()
             )
             await interaction.followup.send(embed=embed)

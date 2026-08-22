@@ -72,7 +72,7 @@ YTDL_OPTIONS = {
     "source_address": "0.0.0.0",
     "extractor_args": {
         "youtube": {
-            "player_client": ["mweb", "web_creator", "tv", "ios", "android"]
+            "player_client": ["tv", "web_creator", "ios", "mweb", "android"]
         }
     },
 }
@@ -82,11 +82,23 @@ if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
 
 
 
-# FFmpeg 串流優化設定：啟用斷線重連、1MB 快取緩衝、2秒特徵分析、aresample=48000:async=1 時間戳鎖定，徹底根治卡頓、忽快忽慢與提早進拍點
+# FFmpeg 串流優化設定：區分網路與本機檔選項，動態避開 Option reconnect not found 錯誤，並清空重複 -ar/-ac 參數
+FFMPEG_OPTIONS_HTTP = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 1M -analyzeduration 2000000"
+FFMPEG_OPTIONS_LOCAL = "-probesize 1M -analyzeduration 2000000"
+FFMPEG_OPTIONS_CLEAN = "-vn -af aresample=48000:async=1"
+
 FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 1M -analyzeduration 2000000",
-    "options": "-vn -f s16le -ar 48000 -ac 2 -af aresample=48000:async=1",
+    "before_options": FFMPEG_OPTIONS_HTTP,
+    "options": FFMPEG_OPTIONS_CLEAN,
 }
+
+def get_ffmpeg_before_options(stream_url: str, offset_seconds: int = 0) -> str:
+    is_http = stream_url.startswith("http://") or stream_url.startswith("https://")
+    base = FFMPEG_OPTIONS_HTTP if is_http else FFMPEG_OPTIONS_LOCAL
+    if offset_seconds > 0:
+        return f"-ss {offset_seconds} {base}"
+    return base
+
 
 
 
@@ -423,10 +435,7 @@ class MusicCog(commands.Cog):
         self.cancel_idle_timer(player)
         player.current_track = track
 
-        if offset_seconds > 0:
-            ffmpeg_before = f"-ss {offset_seconds} {FFMPEG_OPTIONS['before_options']}"
-        else:
-            ffmpeg_before = FFMPEG_OPTIONS['before_options']
+        ffmpeg_before = get_ffmpeg_before_options(track.stream_url, offset_seconds)
 
         # 如果前一首還在播放或停止中，等待舊音訊流釋放完畢
         for _ in range(20):
@@ -439,7 +448,7 @@ class MusicCog(commands.Cog):
             source = discord.FFmpegPCMAudio(
                 track.stream_url,
                 before_options=ffmpeg_before,
-                options=FFMPEG_OPTIONS["options"],
+                options=FFMPEG_OPTIONS_CLEAN,
             )
 
             def after_playing(error):
@@ -805,7 +814,12 @@ class MusicCog(commands.Cog):
                         except Exception:
                             pass
 
-                    source = discord.FFmpegPCMAudio(resolved_track.stream_url, **FFMPEG_OPTIONS)
+                    ffmpeg_before = get_ffmpeg_before_options(resolved_track.stream_url)
+                    source = discord.FFmpegPCMAudio(
+                        resolved_track.stream_url,
+                        before_options=ffmpeg_before,
+                        options=FFMPEG_OPTIONS_CLEAN,
+                    )
 
                     def after_playing(error):
                         if error:

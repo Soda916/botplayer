@@ -86,6 +86,7 @@ if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
 FFMPEG_OPTIONS_HTTP = "-threads 2 -probesize 1M -analyzeduration 2000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS_LOCAL = "-threads 2 -probesize 4M -analyzeduration 4000000"
 FFMPEG_OPTIONS_CLEAN = "-map 0:a:0 -vn -af aresample=48000"
+FFMPEG_OPUS_OPTIONS = "-map 0:a:0 -vn"
 
 FFMPEG_OPTIONS = {
     "before_options": FFMPEG_OPTIONS_HTTP,
@@ -434,7 +435,7 @@ class MusicCog(commands.Cog):
             return await discord.FFmpegOpusAudio.from_probe(
                 stream_url,
                 before_options=ffmpeg_before,
-                options=FFMPEG_OPTIONS_CLEAN,
+                options=FFMPEG_OPUS_OPTIONS,
             )
         except Exception as e:
             logger.warning(f"FFmpegOpusAudio 原生創設失敗，降級使用 FFmpegPCMAudio: {e}")

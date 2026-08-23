@@ -86,7 +86,6 @@ if os.path.exists(COOKIE_PATH) and os.path.getsize(COOKIE_PATH) > 0:
 FFMPEG_OPTIONS_HTTP = "-threads 2 -probesize 1M -analyzeduration 2000000 -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
 FFMPEG_OPTIONS_LOCAL = "-threads 2 -probesize 4M -analyzeduration 4000000"
 FFMPEG_OPTIONS_CLEAN = "-map 0:a:0 -vn -af aresample=48000"
-FFMPEG_OPUS_OPTIONS = "-map 0:a:0 -vn"
 
 FFMPEG_OPTIONS = {
     "before_options": FFMPEG_OPTIONS_HTTP,
@@ -429,21 +428,13 @@ class MusicCog(commands.Cog):
                 self.start_idle_timer(player)
 
     async def create_audio_source(self, stream_url: str, offset_seconds: int = 0) -> discord.AudioSource:
-        """創設音訊源：優先使用 FFmpegOpusAudio (C 原生 Opus 轉碼)，徹底消除 CPU 時脈漂移導致之時快時慢問題"""
+        """創設音訊源：沿用 C2 驗證之 FFmpegPCMAudio 穩定路徑"""
         ffmpeg_before = get_ffmpeg_before_options(stream_url, offset_seconds)
-        try:
-            return await discord.FFmpegOpusAudio.from_probe(
-                stream_url,
-                before_options=ffmpeg_before,
-                options=FFMPEG_OPUS_OPTIONS,
-            )
-        except Exception as e:
-            logger.warning(f"FFmpegOpusAudio 原生創設失敗，降級使用 FFmpegPCMAudio: {e}")
-            return discord.FFmpegPCMAudio(
-                stream_url,
-                before_options=ffmpeg_before,
-                options=FFMPEG_OPTIONS_CLEAN,
-            )
+        return discord.FFmpegPCMAudio(
+            stream_url,
+            before_options=ffmpeg_before,
+            options=FFMPEG_OPTIONS_CLEAN,
+        )
 
     def play_track_with_offset(self, guild_id: int, track: Track, offset_seconds: int = 0, paused: bool = False):
         """從指定秒數斷點接續播放歌曲"""
